@@ -1,0 +1,15 @@
+[package]
+name = "match_images"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+local_features = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+ndarray = { workspace = true }
+
+env_logger = "0.11.8"
+image = { workspace = true } 
+imageproc = { workspace = true }
+nshare = { workspace = true }

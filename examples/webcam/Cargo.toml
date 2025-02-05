@@ -1,0 +1,21 @@
+[package]
+edition = "2024"
+name    = "webcam"
+version = "0.1.0"
+
+[dependencies]
+anyhow = "1.0"
+eframe = { version = "0.31", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "wayland"
+] }
+env_logger = { version = "0.11.8", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+log = "0.4"
+v4l = { version = "0.14"  }
+local_features = { workspace = true  }
+ndarray = "0.16.1"
+usearch = "2.17.2"
+nshare = { workspace = true }
+ouroboros = "0.18.5"

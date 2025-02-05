@@ -1,0 +1,12 @@
+[package]
+name = "local_features_python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.4", features = ["extension-module"] }
+local_features = { workspace = true }
+numpy = "0.23.0"

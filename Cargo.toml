@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["local_features", "python", "examples/*"]
+
+[workspace.dependencies]
+local_features = { path = "./local_features/" }
+
+log = "0.4.28"
+image = "0.25.2"
+imageproc = "0.25.0"
+itertools = "0.14.0"
+ndarray = "0.16.1"
+nshare = { version = "0.10.0", default-features = false, features = ["image", "ndarray"] }
+
+[profile.dev.package.local_features]
+opt-level = 2
+
+[workspace.metadata.crane]
+name = "local_features_python"
