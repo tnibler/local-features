@@ -56,6 +56,8 @@ pub enum Error {
     #[error("No suitable Vulkan compute queue  found")]
     NoQueueFound,
 
+    #[error("Error initializing Vulkan: {1}")]
+    VulkanSetup(String, #[source] vulkano::VulkanError),
     #[error(transparent)]
     Vulkan(#[from] vulkano::VulkanError),
     #[error(transparent)]
