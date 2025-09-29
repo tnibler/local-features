@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["local_features", "python", "examples/*"]
+members = ["local_features", "examples/*"]
 
 [workspace.dependencies]
 local_features = { path = "./local_features/" }
@@ -16,4 +16,4 @@ nshare = { version = "0.10.0", default-features = false, features = ["image", "n
 opt-level = 2
 
 [workspace.metadata.crane]
-name = "local_features_python"
+name = "local_features"
