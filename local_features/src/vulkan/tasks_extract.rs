@@ -59,6 +59,10 @@ impl Task for KeypointOrientationTask {
                     height: world.image_height,
                     width: world.image_width,
                     rt_max_keypoints: world.rt_max_keypoints,
+                    coarse_pyr_id: world.physical_resources.samp_coarse_pyr,
+                    // nearest or bilinear linear, is one better than the other?
+                    sampler_id: world.physical_resources.sampler_nearest,
+                    base_downsample: world.fixed_params.orientation_pyramid_base_downsample as i32,
                 },
             )?;
             let wg_count = [world.n_filtered_extrema, 1, 1];

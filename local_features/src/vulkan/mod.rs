@@ -135,6 +135,8 @@ struct FixedParams {
     pub extremum_block_len: u32,
 
     pub patch_pyr_levels: u32,
+    pub ori_pyr_levels: u32,
+    pub orientation_pyramid_base_downsample: u32,
 }
 
 #[derive(Clone)]
@@ -171,6 +173,7 @@ struct BufferIds {
     img_coarse: Id<Image>,
     img_patch_pyr: Id<Image>,
     img_patch_pyr_tmp: Id<Image>,
+    img_coarse_pyr: Id<Image>,
 }
 
 #[derive(Clone)]
@@ -182,7 +185,9 @@ struct PhysicalResources {
     stor_patch_pyr: Vec<StorageImageId>,
     stor_patch_pyr_tmp: StorageImageId,
     samp_patch_pyr_tmp: SampledImageId,
+    samp_coarse_pyr: SampledImageId,
     sampler: SamplerId,
+    sampler_nearest: SamplerId,
 }
 
 index_vec::define_index_type! {
@@ -220,6 +225,7 @@ struct GlobalContext {
     cm_high: f32,
     fix_scale: bool,
     rt_patch_pyr_levels: u32,
+    rt_ori_pyr_levels: u32,
 
     /// Number of scale space extrema (before orientation assignment)
     n_filtered_extrema: u32,
@@ -265,6 +271,7 @@ impl LocalFeaturesVulkan {
         .log2()
         .ceil()
         .round() as u32;
+        let ori_pyr_levels = patch_pyr_levels - params.keypoint_orientation_patch_subsample;
 
         let block_len = 256;
         let fixed_params = FixedParams {
@@ -276,8 +283,10 @@ impl LocalFeaturesVulkan {
             max_extrema: block_len * params.max_blobs.div_ceil(block_len),
             max_keypoints: params.max_features,
             patch_pyr_levels,
+            ori_pyr_levels,
             extremum_block_len: block_len,
             pca: params.pca,
+            orientation_pyramid_base_downsample: params.keypoint_orientation_patch_subsample,
         };
 
         let buffer_layouts = BufferLayouts {
@@ -361,6 +370,8 @@ impl LocalFeaturesVulkan {
 
         let rt_patch_pyr_levels =
             f32::min(width as f32, height as f32).log2().ceil().round() as u32;
+        let rt_ori_pyr_levels =
+            rt_patch_pyr_levels - self.fixed_params.orientation_pyramid_base_downsample;
         let rt_max_extrema = self.fixed_params.max_extrema;
         let rt_max_keypoints = self.fixed_params.max_keypoints;
         self.candidate_blobs_readback.clear();
@@ -397,6 +408,7 @@ impl LocalFeaturesVulkan {
             rt_max_extrema,
             rt_max_keypoints,
             rt_patch_pyr_levels,
+            rt_ori_pyr_levels,
             patch_scale_factor: self.tweak_params.patch_scale_factor,
 
             // set after blob filtering
@@ -833,6 +845,23 @@ fn allocate_buffers(
         &AllocationCreateInfo::default(),
     )?;
 
+    let orientation_downsample_factor =
+        2f32.powi(params.orientation_pyramid_base_downsample as i32);
+    let orientation_pyr_width =
+        (params.max_image_width as f32 / orientation_downsample_factor).round() as u32;
+    let orientation_pyr_height =
+        (params.max_image_height as f32 / orientation_downsample_factor).round() as u32;
+    let img_coarse_pyr_id = resources.create_image(
+        &ImageCreateInfo {
+            mip_levels: params.ori_pyr_levels,
+            extent: [orientation_pyr_width, orientation_pyr_height, 1],
+            format: Format::R32_SFLOAT,
+            usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
+        &AllocationCreateInfo::default(),
+    )?;
+
     let bcx = resources.bindless_context().expect("has been created");
     let img_coarse = resources.image(img_coarse_id).unwrap();
     let samp_coarse = bcx.global_set().create_sampled_image(
@@ -896,6 +925,19 @@ fn allocate_buffers(
         })
         .try_collect()?;
 
+    let img_coarse_pyr = resources.image(img_coarse_pyr_id).unwrap();
+    let samp_coarse_pyr = bcx.global_set().create_sampled_image(
+        img_coarse_pyr_id,
+        &ImageViewCreateInfo {
+            view_type: ImageViewType::Dim2d,
+            format: Format::R32_SFLOAT,
+            subresource_range: img_coarse_pyr.image().subresource_range(),
+            usage: ImageUsage::SAMPLED,
+            ..Default::default()
+        },
+        ImageLayout::General,
+    )?;
+
     let img_patch_pyr_tmp = resources.image(img_patch_pyr_tmp_id).unwrap();
     let samp_patch_pyr_tmp = bcx.global_set().create_sampled_image(
         img_patch_pyr_tmp_id,
@@ -924,11 +966,17 @@ fn allocate_buffers(
         ..SamplerCreateInfo::simple_repeat_linear()
     })?;
 
+    let sampler_nearest = bcx.global_set().create_sampler(&SamplerCreateInfo {
+        address_mode: [SamplerAddressMode::MirroredRepeat; 3],
+        ..SamplerCreateInfo::new()
+    })?;
+
     Ok(PhysicalResources {
         ids: BufferIds {
             buf_staging,
             img_patch_pyr: img_patch_pyr_id,
             img_patch_pyr_tmp: img_patch_pyr_tmp_id,
+            img_coarse_pyr: img_coarse_pyr_id,
             buf_constants,
             buf_fine,
             buf_extremum_locations,
@@ -944,7 +992,9 @@ fn allocate_buffers(
         stor_patch_pyr,
         stor_patch_pyr_tmp,
         samp_patch_pyr_tmp,
+        samp_coarse_pyr,
         sampler,
+        sampler_nearest,
     })
 }
 
@@ -1018,6 +1068,7 @@ fn build_detect_taskgraph(
         t.build()
     };
 
+    // reads from coarse layer 0, writes temp image to layer 1
     let horz_blur_node_id = taskgraph
         .create_task_node(
             "blur horizontal",
@@ -1040,6 +1091,7 @@ fn build_detect_taskgraph(
         )
         .build();
 
+    // reads from coarse layer 1, writes layer 0
     let vert_blur_node_id = taskgraph
         .create_task_node(
             "blur vertical",
@@ -1073,8 +1125,12 @@ fn build_detect_taskgraph(
         .unwrap();
 
     let n_coarse_levels = params.n_scales + 3;
-    let swt_nodes: Vec<(_, _)> = (0..n_coarse_levels - 1)
-        .map(|scale| {
+    let (first_swt_node, last_swt_node, _last_coarse_pyr_node, _last_patch_pyr_node) = {
+        let mut first_blur = None;
+        let mut last_blur = None;
+        let mut last_coarse_pyr = None;
+        let mut last_patch_pyr = None;
+        for scale in 0..n_coarse_levels - 1 {
             let horizontal = taskgraph
                 .create_task_node(
                     format!("swt-{scale}-horz"),
@@ -1121,40 +1177,71 @@ fn build_detect_taskgraph(
                     ImageLayoutType::General,
                 )
                 .build();
-            (horizontal, vertical)
-        })
-        .collect();
+            if let Some(prev) = last_blur {
+                taskgraph.add_edge(prev, horizontal).unwrap();
+            }
+            taskgraph.add_edge(horizontal, vertical).unwrap();
+
+            if scale >= 1 {
+                let downscale_factor = 0.5f32
+                    .powi(scale as i32 - 1 + params.orientation_pyramid_base_downsample as i32);
+                let blit_pyr_node = taskgraph
+                    .create_task_node(
+                        format!("blit coarse pyramid {scale}"),
+                        QueueFamilyType::Graphics,
+                        BlitPyramidImageTask {
+                            vimg_src: virtual_ids.img_coarse,
+                            vimg_dst: virtual_ids.img_coarse_pyr,
+                            src_array_layer: scale,
+                            dst_mip_level: scale - 1,
+                            scale_factor: downscale_factor,
+                        },
+                    )
+                    .image_access(
+                        virtual_ids.img_coarse,
+                        AccessTypes::BLIT_TRANSFER_READ,
+                        ImageLayoutType::General,
+                    )
+                    .image_access(
+                        virtual_ids.img_coarse_pyr,
+                        AccessTypes::BLIT_TRANSFER_WRITE,
+                        ImageLayoutType::Optimal,
+                    )
+                    .build();
+                taskgraph.add_edge(vertical, blit_pyr_node).unwrap();
+                last_coarse_pyr = Some(blit_pyr_node);
+            }
+
+            if first_blur.is_none() {
+                first_blur = Some(horizontal);
+
+                // pyramid uses first fully blurred coarse layer to save one redundant filtering pass
+                // before decimating
+                let (pyr_start_node_id, pyr_end_node_id) = patch_pyramid::patch_pyramid_nodes(
+                    patch_pyramid::PatchPyramidArgs {
+                        n_levels: params.patch_pyr_levels,
+                        coarse_image_id: virtual_ids.img_coarse,
+                        pyr_image_id: virtual_ids.img_patch_pyr,
+                        tmp_image_id: virtual_ids.img_patch_pyr_tmp,
+                    },
+                    pipelines.blur_pyramid.clone(),
+                    &mut taskgraph,
+                );
+                taskgraph.add_edge(vertical, pyr_start_node_id).unwrap();
+                last_patch_pyr = Some(pyr_end_node_id);
+            }
+            last_blur = Some(vertical);
+        }
+        (
+            first_blur.unwrap(),
+            last_blur.unwrap(),
+            last_coarse_pyr.unwrap(),
+            last_patch_pyr.unwrap(),
+        )
+    };
 
     taskgraph
-        .add_edge(vert_blur_node_id, swt_nodes.first().unwrap().0)
-        .unwrap();
-    taskgraph
-        .add_edge(swt_nodes.first().unwrap().0, swt_nodes.first().unwrap().1)
-        .unwrap();
-    swt_nodes.iter().tuple_windows().for_each(
-        |((_prev_horz, prev_vert), (next_horz, next_vert))| {
-            taskgraph.add_edge(*prev_vert, *next_horz).unwrap();
-            taskgraph.add_edge(*next_horz, *next_vert).unwrap();
-        },
-    );
-
-    let after_coarse1_node_id = swt_nodes
-        .last()
-        .expect("there are at least 4 coarse images (1 + 3 aux)")
-        .1;
-
-    let (pyr_start_node_id, pyr_end_node_id) = patch_pyramid::patch_pyramid_nodes(
-        patch_pyramid::PatchPyramidArgs {
-            n_levels: params.patch_pyr_levels,
-            coarse_image_id: virtual_ids.img_coarse,
-            pyr_image_id: virtual_ids.img_patch_pyr,
-            tmp_image_id: virtual_ids.img_patch_pyr_tmp,
-        },
-        pipelines.blur_pyramid.clone(),
-        &mut taskgraph,
-    );
-    taskgraph
-        .add_edge(after_coarse1_node_id, pyr_start_node_id)
+        .add_edge(vert_blur_node_id, first_swt_node)
         .unwrap();
 
     let swtsub_node_id = taskgraph
@@ -1178,9 +1265,7 @@ fn build_detect_taskgraph(
         )
         .build();
 
-    taskgraph
-        .add_edge(swt_nodes.last().unwrap().1, swtsub_node_id)
-        .unwrap();
+    taskgraph.add_edge(last_swt_node, swtsub_node_id).unwrap();
 
     let scan_extrema_node_id = taskgraph
         .create_task_node(
@@ -1209,10 +1294,6 @@ fn build_detect_taskgraph(
 
     taskgraph
         .add_edge(swtsub_node_id, scan_extrema_node_id)
-        .unwrap();
-
-    taskgraph
-        .add_edge(pyr_end_node_id, scan_extrema_node_id)
         .unwrap();
 
     if params.use_staging_buffers == StagingBuffers::Yes {
@@ -1712,6 +1793,7 @@ fn resource_map<'a, W>(
         virt.img_coarse => phys_buffers.img_coarse,
         virt.img_patch_pyr => phys_buffers.img_patch_pyr,
         virt.img_patch_pyr_tmp => phys_buffers.img_patch_pyr_tmp,
+        virt.img_coarse_pyr => phys_buffers.img_coarse_pyr,
     )
     .expect("TODO")
 }
@@ -1729,6 +1811,7 @@ fn make_virtual_ids<W>(taskgraph: &mut TaskGraph<W>) -> BufferIds {
         img_coarse: taskgraph.add_image(&ImageCreateInfo::default()),
         img_patch_pyr: taskgraph.add_image(&ImageCreateInfo::default()),
         img_patch_pyr_tmp: taskgraph.add_image(&ImageCreateInfo::default()),
+        img_coarse_pyr: taskgraph.add_image(&ImageCreateInfo::default()),
     }
 }
 

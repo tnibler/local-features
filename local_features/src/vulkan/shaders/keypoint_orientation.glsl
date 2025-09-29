@@ -14,10 +14,13 @@ layout(push_constant) uniform KeypointOrientationPc {
     FilteredExtrema filtered_extrema;
     KeypointIndices keypoints;
     StorageImageId coarse_image_id;
+    SampledImageId coarse_pyr_id;
+    SamplerId sampler_id;
 
     uint width;
     uint height;
     uint rt_max_keypoints;
+    int base_downsample;
 };
 
 const int MAX_ORI_PATCH_RADIUS = 7;
@@ -40,9 +43,12 @@ void main() {
     const int local_x = int(gl_LocalInvocationID.x);
     const int local_y = int(gl_LocalInvocationID.y);
 
-    const float kp_x = get_extremum_x_float(extremum_locations, extremum_idx);
-    const float kp_y = get_extremum_y_float(extremum_locations, extremum_idx);
-    const float kp_size = get_extremum_scale_float(extremum_locations, extremum_idx);
+    // The 0th layer in the pyramid of coarse/blurred images is downsampled by this factor.
+    const float base_scale = pow(0.5, base_downsample);
+
+    const float kp_x = get_extremum_x_float(extremum_locations, extremum_idx) * base_scale;
+    const float kp_y = get_extremum_y_float(extremum_locations, extremum_idx) * base_scale;
+    const float kp_size = get_extremum_scale_float(extremum_locations, extremum_idx) * base_scale;
     const int kp_xi = int(kp_x);
     const int kp_yi = int(kp_y);
 
@@ -51,6 +57,9 @@ void main() {
     const uint kp_scale_level = uint(round(log2(kp_size / (DOG_FIRST_SCALE_SIGMA * DOG_SIGMA_RADIUS_FACTOR))));
 
     const int step = 1 << kp_scale_level; // FIXME: 2^log2 kindof redundant
+    const int layer = int(kp_scale_level);
+    const int pyr_step = 1 << layer;
+
 
     const int radius = int(round(3 * 1.5 * kp_size / DOG_SIGMA_RADIUS_FACTOR));
     const float sigma = 1.5 * kp_size / DOG_SIGMA_RADIUS_FACTOR;
@@ -63,25 +72,38 @@ void main() {
         sh_rawhist[local_id] = 0;
     }
 
+    const float width_scaled = width * base_scale;
+    const float height_scaled = height * base_scale;
+
     bool in_load_radius = false;
     bool in_grad_radius = false;
     const int x_patch = int(local_x) - MAX_ORI_PATCH_RADIUS;
     const int y_patch = int(local_y) - MAX_ORI_PATCH_RADIUS;
-    const int x_patch_dilated = x_patch * step;
-    const int y_patch_dilated = y_patch * step;
+
+    const int x_patch_dilated = x_patch * pyr_step;
+    const int y_patch_dilated = y_patch * pyr_step;
     const int x_img = kp_xi + x_patch_dilated;
     const int y_img = kp_yi + y_patch_dilated;
-    if (local_x < ORI_PATCH_SIZE && local_y < ORI_PATCH_SIZE) {
-        const bool valid_px = 0 <= x_img && x_img < width && 0 <= y_img && y_img <= height ;
-        in_load_radius = valid_px && abs(x_patch_dilated) <= radius + step && abs(y_patch_dilated) <= radius + step;
-        in_grad_radius = valid_px && abs(x_patch_dilated) <= radius && abs(y_patch_dilated) <= radius;
 
-        if (valid_px /* && in_load_radius */) {
-            sh_patch[local_y * ORI_PATCH_SIZE + local_x] = imageLoadCoarse(ivec3(x_img, y_img, kp_scale_level));
-        } else {
-            sh_patch[local_y * ORI_PATCH_SIZE + local_x] = 0;
-        }
-    }    
+    const ivec2 texture_size = textureSize(vko_texture2D(coarse_pyr_id), 0);
+
+    const bool valid_px = 0 <= x_img && x_img < width_scaled && 0 <= y_img && y_img < height_scaled ;
+    in_load_radius = valid_px && abs(x_patch_dilated) <= radius + step && abs(y_patch_dilated) <= radius + step;
+    in_grad_radius = valid_px && abs(x_patch_dilated) <= radius && abs(y_patch_dilated) <= radius;
+
+    if (valid_px && in_load_radius) {
+        const float sample_x = (x_img + 0.5) / float(texture_size.x);
+        const float sample_y = (y_img + 0.5) / float(texture_size.y);
+        float value = textureLod(
+            vko_sampler2D(coarse_pyr_id, sampler_id),
+            vec2(sample_x, sample_y),
+            layer
+        ).r;
+        sh_patch[local_y * ORI_PATCH_SIZE + local_x] = value;
+    } else {
+        sh_patch[local_y * ORI_PATCH_SIZE + local_x] = 0;
+    }
+
     barrier();
     memoryBarrierShared();
 

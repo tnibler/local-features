@@ -59,6 +59,8 @@ pub struct BuildTimeParams {
     pub max_features: u32,
     pub max_blobs: u32,
     pub pca: MKDPCA,
+    /// Exponent, so 1 means downsampling by a factor of 2
+    pub keypoint_orientation_patch_subsample: u32,
 }
 
 impl Default for BuildTimeParams {
@@ -70,6 +72,7 @@ impl Default for BuildTimeParams {
             max_image_height: 0,
             max_image_width: 0,
             pca: MKDPCA::LIBERTY,
+            keypoint_orientation_patch_subsample: 0,
         }
     }
 }

@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
+use log::debug;
 use vulkano::{
     buffer::Buffer,
-    image::{Image, ImageAspects},
+    image::{Image, ImageAspects, ImageSubresourceLayers},
     pipeline::{ComputePipeline, Pipeline},
 };
 use vulkano_taskgraph::{
-    command_buffer::{BufferImageCopy, RecordingCommandBuffer},
-    resource::ImageLayoutType,
     Id, Task, TaskContext, TaskResult,
+    command_buffer::{BlitImageInfo, BufferImageCopy, ImageBlit, RecordingCommandBuffer},
+    resource::ImageLayoutType,
 };
 
 use super::{BlurDirection, GlobalContext, shaders};
@@ -310,6 +311,63 @@ impl Task for ScanExtremaTask {
         };
         unsafe {
             cbf.dispatch(wg_count)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct BlitPyramidImageTask {
+    pub vimg_src: Id<Image>,
+    pub vimg_dst: Id<Image>,
+    pub src_array_layer: u32,
+    pub dst_mip_level: u32,
+    pub scale_factor: f32,
+}
+
+impl Task for BlitPyramidImageTask {
+    type World = GlobalContext;
+    unsafe fn execute(
+        &self,
+        cbf: &mut vulkano_taskgraph::command_buffer::RecordingCommandBuffer<'_>,
+        _tcx: &mut vulkano_taskgraph::TaskContext<'_>,
+        world: &Self::World,
+    ) -> vulkano_taskgraph::TaskResult {
+        if self.src_array_layer >= world.rt_ori_pyr_levels {
+            return Ok(());
+        }
+        let dst_offset = [
+            (world.image_width as f32 * self.scale_factor).round() as u32,
+            (world.image_height as f32 * self.scale_factor).round() as u32,
+            1,
+        ];
+        debug!(
+            "Coarse level {} to level {} {}x{}",
+            self.src_array_layer, self.dst_mip_level, dst_offset[0], dst_offset[1]
+        );
+        unsafe {
+            cbf.blit_image(&BlitImageInfo {
+                src_image: self.vimg_src,
+                dst_image: self.vimg_dst,
+                src_image_layout: ImageLayoutType::General,
+                dst_image_layout: ImageLayoutType::General,
+                filter: vulkano::image::sampler::Filter::Nearest,
+                regions: &[ImageBlit {
+                    src_subresource: ImageSubresourceLayers {
+                        aspects: ImageAspects::COLOR,
+                        base_array_layer: self.src_array_layer,
+                        ..Default::default()
+                    },
+                    src_offsets: [[0, 0, 0], [world.image_width, world.image_height, 1]],
+                    dst_subresource: ImageSubresourceLayers {
+                        aspects: ImageAspects::COLOR,
+                        mip_level: self.dst_mip_level,
+                        ..Default::default()
+                    },
+                    dst_offsets: [[0, 0, 0], dst_offset],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })?;
         }
         Ok(())
     }
