@@ -2,36 +2,50 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use log::{debug, trace};
+use thiserror::Error;
 use vulkano::{
+    Version, VulkanLibrary,
     device::{
-        physical::PhysicalDevice, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures,
-        Queue, QueueCreateInfo, QueueFlags,
+        Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo,
+        QueueFlags, physical::PhysicalDevice,
     },
     instance::{Instance, InstanceCreateInfo},
-    VulkanLibrary,
 };
 use vulkano_taskgraph::descriptor_set::BindlessContext;
 
-use super::Error;
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum VulkanInitError {
+    #[error(transparent)]
+    Loading(#[from] vulkano::LoadingError),
+
+    #[error("Unsupported vulkan version: found {have}, need at least {want}")]
+    IncompatibleVulkanVersion { have: Version, want: Version },
+
+    #[error("No suitable Vulkan device found")]
+    NoDeviceFound,
+    #[error("No suitable Vulkan compute queue  found")]
+    NoQueueFound,
+
+    #[error(transparent)]
+    Other(#[from] vulkano::Validated<vulkano::VulkanError>),
+}
 
 #[derive(Clone)]
 pub struct Vulkan {
-    pub instance: Arc<Instance>,
-    pub physical_device: Arc<PhysicalDevice>,
-    pub device: Arc<Device>,
-    pub queue_family_index: u32,
-    pub queue: Arc<Queue>,
+    pub(crate) device: Arc<Device>,
+    pub(crate) queue: Arc<Queue>,
 }
 
 impl Vulkan {
-    pub fn new() -> Result<Self, Error> {
-        let vklib = VulkanLibrary::new().map_err(Error::Loading)?;
+    pub fn new() -> Result<Self, VulkanInitError> {
+        let vklib = VulkanLibrary::new().map_err(VulkanInitError::Loading)?;
         let version = vklib.api_version();
         debug!("Vulkan version: {version}");
         if version.minor < 2 {
-            return Err(Error::IncompatibleVulkanVersion {
-                have: format!("{}.{}.{}", version.major, version.minor, version.patch),
-                want: "1.2".to_string(),
+            return Err(VulkanInitError::IncompatibleVulkanVersion {
+                have: version,
+                want: Version::major_minor(1, 2),
             });
         }
         let instance = Instance::new(&vklib, &InstanceCreateInfo::default())?;
@@ -42,9 +56,7 @@ impl Vulkan {
 
         let physical_device: Arc<PhysicalDevice> = instance
             .enumerate_physical_devices()
-            .map_err(|err| {
-                Error::VulkanSetup("could not enumerate physical devices".to_string(), err)
-            })?
+            .map_err(|err| VulkanInitError::Other(vulkano::Validated::Error(err)))?
             .inspect(|dev| {
                 trace!(
                     "Available device: {} ({:?}), {}",
@@ -68,12 +80,12 @@ impl Vulkan {
             .find(|p| {
                 p.supported_extensions().contains(&required_extensions)
                     && p.supported_features().contains(&required_features)
-                    && p.supported_extensions().contains(&DeviceExtensions {
-                        ext_subgroup_size_control: true,
-                        ..Default::default()
-                    })
+                // && p.supported_extensions().contains(&DeviceExtensions {
+                //     ext_subgroup_size_control: true,
+                //     ..Default::default()
+                // })
             })
-            .ok_or(Error::NoDeviceFound)?;
+            .ok_or(VulkanInitError::NoDeviceFound)?;
 
         debug!("Using device: {}", physical_device.properties().device_name);
 
@@ -81,9 +93,9 @@ impl Vulkan {
             .queue_family_properties()
             .iter()
             .position(|props| props.queue_flags.contains(QueueFlags::COMPUTE))
-            .ok_or(Error::NoQueueFound)? as u32;
+            .ok_or(VulkanInitError::NoQueueFound)? as u32;
 
-        trace!("Found suitable queue family, creating Vulkan device");
+        trace!("Found suitable queue family {queue_family_index}, creating Vulkan device");
 
         let (device, mut queues) = Device::new(
             &physical_device,
@@ -112,15 +124,12 @@ impl Vulkan {
             },
         )?;
         trace!("Created device");
-        let queue = queues.next().ok_or(Error::NoQueueFound)?;
-        trace!("Found suitable queue");
-
-        Ok(Self {
-            instance,
-            physical_device,
-            queue_family_index,
-            device,
-            queue,
-        })
+        let queue = queues.next().expect("there should be exactly 1 queue, since 1 queue family index was supplied to Device::new");
+        trace!(
+            "Vulkan initialized with queue family index {}, queue index {}",
+            queue.queue_family_index(),
+            queue.queue_index()
+        );
+        Ok(Self { device, queue })
     }
 }

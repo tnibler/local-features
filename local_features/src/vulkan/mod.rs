@@ -13,26 +13,27 @@ use vulkano::{
     device::Queue,
     format::Format,
     image::{
+        Image, ImageAspects, ImageCreateInfo, ImageLayout, ImageUsage,
         sampler::{SamplerAddressMode, SamplerCreateInfo},
         view::{ImageViewCreateInfo, ImageViewType},
-        Image, ImageAspects, ImageCreateInfo, ImageLayout, ImageUsage,
     },
     memory::allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter},
     sync::{AccessFlags, PipelineStages},
 };
 use vulkano_taskgraph::{
+    Id, QueueFamilyType, TaskContext,
     command_buffer::{BufferMemoryBarrier, CopyBufferInfo, DependencyInfo, RecordingCommandBuffer},
     descriptor_set::{self, SampledImageId, SamplerId, StorageImageId},
     graph::{CompileInfo, ExecutableTaskGraph, ResourceMap, TaskGraph},
     resource::{
         AccessTypes, Flight, HostAccessType, ImageLayoutType, Resources, ResourcesCreateInfo,
     },
-    resource_map, Id, QueueFamilyType, TaskContext,
+    resource_map,
 };
 
 use crate::{
-    BuildTimeParams, FeatureDetectParams, FeaturesResult, Keypoint, DESCRIPTOR_LEN,
-    DIMS_EMB_CARTESIAN, DIMS_EMB_POLAR, DIMS_INPUT, MKDPCA, PATCH_SIZE, RAW_DESCRIPTOR_LEN,
+    BuildTimeParams, DESCRIPTOR_LEN, DIMS_EMB_CARTESIAN, DIMS_EMB_POLAR, DIMS_INPUT,
+    FeatureDetectParams, FeaturesResult, Keypoint, MKDPCA, PATCH_SIZE, RAW_DESCRIPTOR_LEN,
 };
 
 mod make_a_vulkan;
@@ -42,22 +43,11 @@ mod tasks_common;
 mod tasks_detect;
 mod tasks_extract;
 
-pub use make_a_vulkan::Vulkan;
+pub use make_a_vulkan::{Vulkan, VulkanInitError};
 
 #[non_exhaustive]
 #[derive(Error, Debug)]
-pub enum Error {
-    #[error(transparent)]
-    Loading(#[from] vulkano::LoadingError),
-    #[error("Unsupported vulkan version: found {have}, need at least {want}")]
-    IncompatibleVulkanVersion { have: String, want: String },
-    #[error("No suitable Vulkan device found")]
-    NoDeviceFound,
-    #[error("No suitable Vulkan compute queue  found")]
-    NoQueueFound,
-
-    #[error("Error initializing Vulkan: {1}")]
-    VulkanSetup(String, #[source] vulkano::VulkanError),
+pub enum VulkanError {
     #[error(transparent)]
     Vulkan(#[from] vulkano::VulkanError),
     #[error(transparent)]
@@ -250,11 +240,11 @@ enum BlurDirection {
 }
 
 impl LocalFeaturesVulkan {
-    pub fn new(
+    pub(crate) fn new(
         params: BuildTimeParams,
         tweak_params: FeatureDetectParams,
         vk: Vulkan,
-    ) -> Result<Self, crate::vulkan::Error> {
+    ) -> Result<Self, crate::vulkan::VulkanError> {
         let use_staging_buffers = StagingBuffers::Yes;
         let resources = Resources::new(
             &vk.device,
@@ -346,7 +336,7 @@ impl LocalFeaturesVulkan {
     pub fn detect_extract_all(
         &mut self,
         img: &ArrayView2<f32>,
-    ) -> Result<FeaturesResult, crate::vulkan::Error> {
+    ) -> Result<FeaturesResult, crate::vulkan::VulkanError> {
         self.detect(img, None)
     }
 
@@ -355,7 +345,7 @@ impl LocalFeaturesVulkan {
         img: &ArrayView2<f32>,
         n: u32,
         min_size: f32,
-    ) -> Result<FeaturesResult, crate::vulkan::Error> {
+    ) -> Result<FeaturesResult, crate::vulkan::VulkanError> {
         let mut filter = TopKContrastFilter { min_size, n };
         self.detect(img, Some(&mut filter))
     }
@@ -364,7 +354,7 @@ impl LocalFeaturesVulkan {
         &mut self,
         img: &ArrayView2<f32>,
         filter_keypoints: Option<&mut dyn FilterBlobs>,
-    ) -> Result<FeaturesResult, crate::vulkan::Error> {
+    ) -> Result<FeaturesResult, crate::vulkan::VulkanError> {
         assert!(img.as_slice().is_some());
         let width: u32 = img.ncols().try_into().expect("TODO");
         let height: u32 = img.nrows().try_into().expect("TODO");
@@ -429,8 +419,10 @@ impl LocalFeaturesVulkan {
             .unwrap()
             .wait(None)?;
 
+        let start = std::time::Instant::now();
         let dropped_extrema: u32 =
             self.do_extremum_readback(&mut global_context, filter_keypoints)?;
+        debug!("Extrema readback took {:?}", start.elapsed());
 
         let extract_resource_map = resource_map(
             &self.extract.taskgraph,
@@ -462,21 +454,9 @@ impl LocalFeaturesVulkan {
                 self.physical_resources.ids.buf_staging,
                 HostAccessType::Read,
             )];
-            let readback_buffer_accesses = [
-                (
-                    self.physical_resources.ids.buf_keypoints,
-                    AccessTypes::COPY_TRANSFER_READ,
-                ),
-                (
-                    self.physical_resources.ids.buf_embeddings_or_descriptors,
-                    AccessTypes::COPY_TRANSFER_READ,
-                ),
-                (
-                    self.physical_resources.ids.buf_staging,
-                    AccessTypes::COPY_TRANSFER_WRITE,
-                ),
-            ];
+            let readback_buffer_accesses = [];
             let readback_image_accesses = [];
+            let start = std::time::Instant::now();
             trace!("Executing descriptor readback taskgraph");
             unsafe {
                 vulkano_taskgraph::execute(
@@ -544,6 +524,7 @@ impl LocalFeaturesVulkan {
                 self.resources.flight(self.flight_id).unwrap().wait(None)?;
                 trace!("Waited on descriptor readback flight");
             }
+            debug!("Descriptor readback took {:?}", start.elapsed());
         } else {
             let readback_host_buffer_accesses = [
                 (
@@ -597,7 +578,7 @@ impl LocalFeaturesVulkan {
         &mut self,
         global_context: &mut GlobalContext,
         filter_keypoints: Option<&mut dyn FilterBlobs>,
-    ) -> Result<u32, crate::vulkan::Error> {
+    ) -> Result<u32, crate::vulkan::VulkanError> {
         let readback_from_buffer = match self.fixed_params.use_staging_buffers {
             StagingBuffers::Yes => self.physical_resources.ids.buf_staging,
             StagingBuffers::No => self.physical_resources.ids.buf_extremum_locations,
@@ -695,7 +676,7 @@ fn allocate_buffers(
     resources: &Resources,
     params: &FixedParams,
     buffers: &BufferLayouts,
-) -> Result<PhysicalResources, crate::vulkan::Error> {
+) -> Result<PhysicalResources, crate::vulkan::VulkanError> {
     let img_size: u64 = u64::from(params.max_image_width) * u64::from(params.max_image_height);
     let img_size = img_size + 4 - (img_size % 4);
     let max_keypoints: u64 = params.max_keypoints.into();
@@ -734,7 +715,7 @@ fn allocate_buffers(
                 .expect("array not empty");
                 DeviceLayout::from_size_alignment(size, align)
             }
-            .ok_or(crate::vulkan::Error::TODO)?;
+            .ok_or(crate::vulkan::VulkanError::TODO)?;
             resources.create_buffer(
                 &BufferCreateInfo {
                     usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
@@ -837,6 +818,7 @@ fn allocate_buffers(
         },
         &AllocationCreateInfo::default(),
     )?;
+
     let img_patch_pyr_id = resources.create_image(
         &ImageCreateInfo {
             mip_levels: params.patch_pyr_levels,
@@ -973,7 +955,7 @@ fn build_detect_taskgraph(
     buffers: &BufferLayouts,
     pipelines: &ComputePipelines,
     vk: &Vulkan,
-) -> Result<Detect, crate::vulkan::Error> {
+) -> Result<Detect, crate::vulkan::VulkanError> {
     use tasks_common::*;
     use tasks_detect::*;
 
@@ -1139,9 +1121,9 @@ fn build_detect_taskgraph(
                     ImageLayoutType::General,
                 )
                 .build();
-            Ok::<_, crate::vulkan::Error>((horizontal, vertical))
+            (horizontal, vertical)
         })
-        .try_collect()?;
+        .collect();
 
     taskgraph
         .add_edge(vert_blur_node_id, swt_nodes.first().unwrap().0)
@@ -1170,7 +1152,7 @@ fn build_detect_taskgraph(
         },
         pipelines.blur_pyramid.clone(),
         &mut taskgraph,
-    )?;
+    );
     taskgraph
         .add_edge(after_coarse1_node_id, pyr_start_node_id)
         .unwrap();
@@ -1281,7 +1263,7 @@ fn build_extract_taskgraph(
     buffer_layouts: &BufferLayouts,
     pipelines: &ComputePipelines,
     vk: &Vulkan,
-) -> Result<Extract, crate::vulkan::Error> {
+) -> Result<Extract, crate::vulkan::VulkanError> {
     use tasks_common::*;
     use tasks_extract::*;
 
@@ -1590,7 +1572,7 @@ fn upload_constant_data(
     queue: &Arc<Queue>,
     resources: &Arc<Resources>,
     flight_id: Id<Flight>,
-) -> Result<(), crate::vulkan::Error> {
+) -> Result<(), crate::vulkan::VulkanError> {
     let crate::mkd_ref::PCAModel {
         mean,
         eigvals,

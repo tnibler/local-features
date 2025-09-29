@@ -6,13 +6,13 @@ use vulkano::{
     pipeline::{ComputePipeline, Pipeline},
 };
 use vulkano_taskgraph::{
-    command_buffer::{BufferCopy, CopyBufferInfo, RecordingCommandBuffer},
     Id, Task, TaskContext, TaskResult,
+    command_buffer::{BufferCopy, CopyBufferInfo, RecordingCommandBuffer},
 };
 
 use crate::{DESCRIPTOR_LEN, DIMS_INPUT};
 
-use super::{shaders, BufferIds, GlobalContext};
+use super::{BufferIds, GlobalContext, shaders};
 
 pub(super) struct KeypointOrientationTask {
     pub vbuf_extremum_locations: Id<Buffer>,

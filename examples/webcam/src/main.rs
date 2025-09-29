@@ -3,7 +3,7 @@ use eframe::{
     App, NativeOptions,
     egui::{self, CentralPanel, Pos2, Response, Stroke, TextureOptions, TopBottomPanel},
 };
-use local_features::{FeaturesResult, Keypoint, LocalFeaturesVulkan};
+use local_features::{FeaturesResult, Keypoint, vulkan::LocalFeaturesVulkan};
 use ndarray::Array2;
 use nshare::AsNdarray2 as _;
 use v4l::context::Node;
@@ -13,8 +13,13 @@ use crate::camera::{CameraImage, CameraWithStream, available_devices, open_devic
 
 const MAX_FEATURES: u32 = 5000;
 
-fn make_local_features(width: u32, height: u32) -> Result<LocalFeaturesVulkan> {
+fn make_local_features(
+    vulkan: &local_features::vulkan::Vulkan,
+    width: u32,
+    height: u32,
+) -> Result<LocalFeaturesVulkan> {
     local_features::new_vulkan(
+        vulkan,
         local_features::BuildTimeParams {
             n_scales: 4,
             max_image_width: width,
@@ -31,6 +36,8 @@ fn make_local_features(width: u32, height: u32) -> Result<LocalFeaturesVulkan> {
 fn main() -> Result<()> {
     env_logger::init();
 
+    let vulkan = local_features::vulkan::Vulkan::new()?;
+
     let available_devices: Vec<_> = available_devices();
     if available_devices.is_empty() {
         bail!("No suitable video device found");
@@ -41,9 +48,10 @@ fn main() -> Result<()> {
     let img = camera.next_frame()?;
 
     let (width, height) = (img.gray.width() as u32, img.gray.height() as u32);
-    let feats = make_local_features(width, height)?;
+    let feats = make_local_features(&vulkan, width, height)?;
 
     let app = WebcamDemo {
+        vulkan,
         available_cameras: available_devices,
         camera,
         selected_camera_index: selected_device,
@@ -70,13 +78,14 @@ fn main() -> Result<()> {
 }
 
 struct WebcamDemo {
+    vulkan: local_features::vulkan::Vulkan,
     available_cameras: Vec<Node>,
     camera: CameraWithStream,
     selected_camera_index: usize,
     changed_camera_index: Option<usize>,
 
     match_image: Option<MatchImage>,
-    local_features: local_features::LocalFeaturesVulkan,
+    local_features: LocalFeaturesVulkan,
     min_feature_size: f32,
     limit_features: u32,
     resolution: (u32, u32),
@@ -126,7 +135,7 @@ impl App for WebcamDemo {
         let CameraImage { rgb_egui, gray } = self.camera.next_frame().unwrap();
         let res = (gray.width(), gray.height());
         if res != self.resolution {
-            self.local_features = make_local_features(res.0, res.1).unwrap();
+            self.local_features = make_local_features(&self.vulkan, res.0, res.1).unwrap();
             self.resolution = res;
             // self.match_image = None;
         }
@@ -177,7 +186,7 @@ impl App for WebcamDemo {
                         }
                     });
                 if selected != self.selected_camera_index {
-                    self.changed_camera_index = Some(selected.clone());
+                    self.changed_camera_index = Some(selected);
                 }
                 ui.label(format!(
                     "Format: {}x{}",

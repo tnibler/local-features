@@ -41,6 +41,15 @@ fn main() -> Result<(), ()> {
     let path2 = &args[2];
     let out_path = &args[3];
 
+    let vulkan = match local_features::vulkan::Vulkan::new() {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("Error creating Vulkan backend");
+            eprintln!("{:?}", err);
+            return Err(());
+        }
+    };
+
     let img1 = match image::open(path1).unwrap().grayscale() {
         image::DynamicImage::ImageLuma8(img) => img,
         _ => {
@@ -60,6 +69,7 @@ fn main() -> Result<(), ()> {
     let img2_f32: image::ImageBuffer<image::Luma<f32>, Vec<f32>> = img2.convert();
 
     let mut feats = local_features::new_vulkan(
+        &vulkan,
         local_features::BuildTimeParams {
             n_scales: 5,
             max_image_width: img1.width().max(img2.width()),
@@ -75,34 +85,40 @@ fn main() -> Result<(), ()> {
     let min_size = 0.0;
     let top_n = 2000;
     info!("Limiting to best {top_n} features, minimum size {min_size}");
+    let start = std::time::Instant::now();
     let result1 = feats
         .detect_top_n(&img1_f32.as_ndarray2(), top_n, min_size)
         .unwrap();
+    let time = start.elapsed();
 
     if result1.dropped_blobs > 0 || result1.dropped_features > 0 {
         info!(
-            "Extracted {} keypoints. {} candidate blobs and {} keypoints did not fit in buffers",
+            "Extracted {} keypoints in {:?}. {} candidate blobs and {} keypoints did not fit in buffers",
             result1.keypoints.len(),
+            time,
             result1.dropped_blobs,
             result1.dropped_features
         );
     } else {
-        info!("Extracted {} keypoints", result1.keypoints.len());
+        info!("Extracted {} keypoints in {:?}", result1.keypoints.len(), time);
     }
 
+    let start = std::time::Instant::now();
     let result2 = feats
         .detect_top_n(&img2_f32.as_ndarray2(), top_n, min_size)
         .unwrap();
+    let time = start.elapsed();
 
     if result2.dropped_blobs > 0 || result2.dropped_features > 0 {
         info!(
-            "Extracted {} keypoints. {} candidate blobs and {} keypoints did not fit in buffers",
+            "Extracted {} keypoints in {:?}. {} candidate blobs and {} keypoints did not fit in buffers",
             result2.keypoints.len(),
+            time,
             result2.dropped_blobs,
             result2.dropped_features
         );
     } else {
-        info!("Extracted {} keypoints", result2.keypoints.len());
+        info!("Extracted {} keypoints in {:?}", result2.keypoints.len(), time);
     }
 
     let FeaturesResult {

@@ -2,10 +2,10 @@
 
 use ndarray::Array2;
 
-mod mkd_ref;
-mod vulkan;
+use crate::vulkan::LocalFeaturesVulkan;
 
-pub use vulkan::{BlobLocationsView, Error, FilterBlobs, FilterBlobsOutput, LocalFeaturesVulkan};
+mod mkd_ref;
+pub mod vulkan;
 
 const DIMS_INPUT: usize = 7;
 const DIMS_EMB_CARTESIAN: usize = 9;
@@ -88,13 +88,13 @@ pub enum LocalFeaturesError {
     #[error("Illegal parameter: {0}")]
     InvalidParameters(String),
     #[error(transparent)]
-    VulkanError(#[from] vulkan::Error),
+    VulkanError(#[from] vulkan::VulkanError),
 }
 
 pub fn new_vulkan(
+    vk: &vulkan::Vulkan,
     fixed_params: BuildTimeParams,
     params: FeatureDetectParams,
 ) -> Result<LocalFeaturesVulkan, LocalFeaturesError> {
-    let vk = vulkan::Vulkan::new()?;
-    Ok(LocalFeaturesVulkan::new(fixed_params, params, vk)?)
+    Ok(LocalFeaturesVulkan::new(fixed_params, params, vk.clone())?)
 }

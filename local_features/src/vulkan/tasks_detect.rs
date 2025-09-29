@@ -11,7 +11,7 @@ use vulkano_taskgraph::{
     Id, Task, TaskContext, TaskResult,
 };
 
-use super::{shaders, BlurDirection, GlobalContext};
+use super::{BlurDirection, GlobalContext, shaders};
 
 pub(super) struct UploadImageTask {
     pub dst_buffer: Id<Buffer>,

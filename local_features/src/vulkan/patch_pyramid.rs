@@ -6,13 +6,13 @@ use vulkano::{
     pipeline::{ComputePipeline, Pipeline},
 };
 use vulkano_taskgraph::{
+    Id, QueueFamilyType, Task,
     command_buffer::{BlitImageInfo, ImageBlit},
     graph::{NodeId, TaskGraph},
     resource::{AccessTypes, ImageLayoutType},
-    Id, QueueFamilyType, Task,
 };
 
-use super::{shaders, BlurDirection, GlobalContext};
+use super::{BlurDirection, GlobalContext, shaders};
 
 struct PatchPyramidTask {
     in_level: u32,
@@ -44,7 +44,7 @@ pub fn patch_pyramid_nodes(
     }: PatchPyramidArgs,
     pipeline: Arc<ComputePipeline>,
     taskgraph: &mut TaskGraph<GlobalContext>,
-) -> Result<(NodeId, NodeId), crate::vulkan::Error> {
+) -> (NodeId, NodeId) {
     assert!(n_levels > 1); // TODO: > or >= 1, and this shoudln't assert just do nothing if we don't have to
 
     let copy0_node_id = taskgraph
@@ -152,7 +152,7 @@ pub fn patch_pyramid_nodes(
         taskgraph.add_edge(horz_node_id, vert_node_id).unwrap();
         end_node = vert_node_id;
     }
-    Ok((start_node, end_node))
+    (start_node, end_node)
 }
 
 impl Task for PatchPyramidTask {
@@ -175,10 +175,7 @@ impl Task for PatchPyramidTask {
         let in_height = world.image_height / 2u32.pow(self.in_level);
         trace!(
             "Blur in_level: {} ({:?}), {}x{}",
-            self.in_level,
-            self.direction,
-            in_width,
-            in_height
+            self.in_level, self.direction, in_width, in_height
         );
         if self.do_bind_pipeline {
             unsafe {
@@ -255,9 +252,7 @@ impl Task for BlitCopyImageTask {
         };
         trace!(
             "Downsample in_level: {} to {}x{}",
-            self.src_array_layer,
-            dst_offset[0],
-            dst_offset[1]
+            self.src_array_layer, dst_offset[0], dst_offset[1]
         );
         unsafe {
             cbf.blit_image(&BlitImageInfo {

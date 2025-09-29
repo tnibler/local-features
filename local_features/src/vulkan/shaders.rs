@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
 use itertools::Itertools;
-use log::debug;
 use vulkano::{
     memory::allocator::DeviceLayout,
     pipeline::{
+        ComputePipeline, PipelineLayout, PipelineShaderStageCreateInfo,
         compute::ComputePipelineCreateInfo,
         layout::{PipelineLayoutCreateInfo, PushConstantRange},
-        ComputePipeline, PipelineLayout, PipelineShaderStageCreateInfo,
     },
     shader::{ShaderStages, SpecializationConstant},
 };
@@ -93,18 +92,13 @@ pub fn create_pipelines(
     params: &FixedParams,
     vk: &Vulkan,
     bcx: &BindlessContext,
-) -> Result<ComputePipelines, crate::vulkan::Error> {
+) -> Result<ComputePipelines, crate::vulkan::VulkanError> {
     let min_subgroup_size = vk
         .device
         .physical_device()
         .properties()
         .min_subgroup_size
         .expect("TODO what now");
-    debug!("min_subgroup_size: {}", min_subgroup_size);
-    assert!(
-        min_subgroup_size >= 8,
-        "must have subgroup_size >= num_subgroups in all shaders, otherwise broken reductions"
-    );
     let specialization_constants = [
         (0u32, SpecializationConstant::U32(min_subgroup_size)),
         // MAX_EXTREMA
@@ -230,7 +224,7 @@ pub struct ExtremumLocationsBufferLayout {
 
 pub fn extremum_locations_buffer_layout(
     params: &FixedParams,
-) -> Result<ExtremumLocationsBufferLayout, crate::vulkan::Error> {
+) -> Result<ExtremumLocationsBufferLayout, crate::vulkan::VulkanError> {
     let max_extrema = params.max_extrema;
 
     let elsize = size_of::<u32>();
@@ -240,8 +234,8 @@ pub fn extremum_locations_buffer_layout(
     let size_extremum_locations = u64::from(4 * max_extrema) * elsize as u64;
     let size_total = (1u64 + 15) * elsize as u64 + size_extremum_locations;
     assert!(size_extremum_locations <= size_total);
-    let layout =
-        DeviceLayout::from_size_alignment(size_total, 4u64).ok_or(crate::vulkan::Error::TODO)?;
+    let layout = DeviceLayout::from_size_alignment(size_total, 4u64)
+        .ok_or(crate::vulkan::VulkanError::TODO)?;
     assert!(params.extremum_block_len > 0);
     Ok(ExtremumLocationsBufferLayout {
         offset_n_extrema,
@@ -329,7 +323,7 @@ pub struct KeypointsBufferLayout {
 
 pub fn keypoints_buffer_layout(
     params: &FixedParams,
-) -> Result<KeypointsBufferLayout, crate::vulkan::Error> {
+) -> Result<KeypointsBufferLayout, crate::vulkan::VulkanError> {
     let max_keypoints = params.max_keypoints;
 
     let elsize = size_of::<u32>();
@@ -341,8 +335,8 @@ pub fn keypoints_buffer_layout(
     let size_keypoints = u64::from(2 * max_keypoints) * elsize as u64;
     let size_total = (1u64 + 15) * elsize as u64 + size_keypoints;
     assert!(size_keypoints <= size_total);
-    let layout =
-        DeviceLayout::from_size_alignment(size_total, 4u64).ok_or(crate::vulkan::Error::TODO)?;
+    let layout = DeviceLayout::from_size_alignment(size_total, 4u64)
+        .ok_or(crate::vulkan::VulkanError::TODO)?;
     Ok(KeypointsBufferLayout {
         offset_n_keypoints,
         offset_extremum_indices,
@@ -360,9 +354,9 @@ pub struct FilteredExtremaBufferLayout {
 
 pub fn filtered_extrema_buffer_layout(
     params: &FixedParams,
-) -> Result<FilteredExtremaBufferLayout, crate::vulkan::Error> {
+) -> Result<FilteredExtremaBufferLayout, crate::vulkan::VulkanError> {
     let size_total = u64::from(1 + params.max_extrema) * size_of::<u32>() as u64;
     let layout =
-        DeviceLayout::from_size_alignment(size_total, 4).ok_or(crate::vulkan::Error::TODO)?;
+        DeviceLayout::from_size_alignment(size_total, 4).ok_or(crate::vulkan::VulkanError::TODO)?;
     Ok(FilteredExtremaBufferLayout { layout, size_total })
 }

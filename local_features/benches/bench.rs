@@ -1,5 +1,6 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use image::{buffer::ConvertBuffer as _, GrayImage};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use image::{GrayImage, buffer::ConvertBuffer as _};
+use local_features::vulkan::Vulkan;
 use ndarray::Array2;
 use nshare::IntoNdarray2 as _;
 use std::{path::Path, time::Duration};
@@ -51,7 +52,9 @@ fn bench(n_scales: u32, scales_feats: Vec<(f32, i32)>, group: &str, c: &mut Crit
             scale,
             max_features,
         };
+        let vk = Vulkan::new().expect("need vulkan");
         let mut lf = local_features::new_vulkan(
+            &vk,
             local_features::BuildTimeParams {
                 n_scales,
                 max_image_width: image.ncols() as u32,
