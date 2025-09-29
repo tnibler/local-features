@@ -1,0 +1,67 @@
+$include["macros.gpp"]
+// TRIM_ABOVE
+#version 460
+#include "extensions.glsl"
+#include "common.gpp.glsl"
+#include "conv_pushconstants.glsl"
+
+// A trous SWT kernel, for levels with >=2 zeros inbetween each kernel element
+
+const int WG_SIZE_X = 16;
+const int WG_SIZE_Y = 4;
+layout(local_size_x = WG_SIZE_X, local_size_y = WG_SIZE_Y) in;
+
+const float KERNEL[] = { 1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.0 };
+
+
+void main() {
+    const int local_x = int(gl_LocalInvocationID.x);
+    const int local_y = int(gl_LocalInvocationID.y);
+    const int wg_x = int(gl_WorkGroupID.x * 2 * WG_SIZE_X);
+    const int wg_y = int(gl_WorkGroupID.y * 2 * WG_SIZE_Y);
+    const int x = wg_x + 2 * local_x;
+    const int y = wg_y + 2 * local_y;
+
+    if (wg_x >= width || wg_y >= height) {
+        return;
+    }
+
+    const int dilate = 1 << in_level;
+    const vec2 texture_size = textureSize(texture_coarse, 0).xy;
+
+    // bl br tr tl
+    vec4 sum = vec4(0);
+    if (vertical_pass) {
+        for (int i = 0; i < KERNEL.length(); i++) {
+            const vec2 loc = vec2(float(x + 1), float(y + (i - 2) * dilate + 1)) / texture_size;
+            const vec4 samp = textureGather(sampler2D(@texture_scratch, @sampler_bil), loc);
+            sum += KERNEL[i] * samp;
+        }
+        imageStore(image_coarse, ivec3(x, y, in_level + 1), vec4(sum[3], 0, 0, 1));
+        if (x < width - 1) {
+            imageStore(image_coarse, ivec3(x + 1, y, in_level + 1), vec4(sum[2], 0, 0, 1));
+        }
+        if (y < height - 1) {
+            imageStore(image_coarse, ivec3(x, y + 1, in_level + 1), vec4(sum[0], 0, 0, 1));
+        }
+        if (x < width - 1 && y < height - 1) {
+            imageStore(image_coarse, ivec3(x + 1, y + 1, in_level + 1), vec4(sum[1], 0, 0, 1));
+        }
+    } else {
+        for (int i = 0; i < KERNEL.length(); i++) {
+            const vec3 loc = vec3(float(x + (i - 2) * dilate + 1) / texture_size.x, float(y + 1) / texture_size.y, in_level);
+            const vec4 samp = textureGather(sampler2DArray(texture_coarse, @sampler_bil), loc);
+            sum += KERNEL[i] * samp;
+        }
+        imageStore(@image_scratch, ivec2(x, y), vec4(sum[3], 0, 0, 1));
+        if (x < width - 1) {
+            imageStore(@image_scratch, ivec2(x + 1, y), vec4(sum[2], 0, 0, 1));
+        }
+        if (y < height - 1) {
+            imageStore(@image_scratch, ivec2(x, y + 1), vec4(sum[0], 0, 0, 1));
+        }
+        if (x < width - 1 && y < height - 1) {
+            imageStore(@image_scratch, ivec2(x + 1, y + 1), vec4(sum[1], 0, 0, 1));
+        }
+    }
+}

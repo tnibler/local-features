@@ -1,7 +1,7 @@
 use vulkano::buffer::Buffer;
 use vulkano_taskgraph::{
-    command_buffer::{BufferCopy, CopyBufferInfo, RecordingCommandBuffer},
     Id, Task, TaskContext, TaskResult,
+    command_buffer::{BufferCopy, CopyBufferInfo, RecordingCommandBuffer},
 };
 
 use super::GlobalContext;
@@ -26,11 +26,7 @@ impl Task for CopyBufferTask {
             cbf.copy_buffer(&CopyBufferInfo {
                 src_buffer: self.src,
                 dst_buffer: self.dst,
-                regions: &[BufferCopy {
-                    size: self.size,
-                    src_offset: self.src_offset,
-                    ..Default::default()
-                }],
+                regions: &[BufferCopy { size: self.size, src_offset: self.src_offset, ..Default::default() }],
                 ..Default::default()
             })?;
         }

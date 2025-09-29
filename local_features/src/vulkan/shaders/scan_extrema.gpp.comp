@@ -1,0 +1,332 @@
+$include["macros.gpp"]
+// TRIM_ABOVE
+#version 460
+#include "extensions.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#include "common.gpp.glsl"
+
+layout(constant_id = NUM_GLOBAL_CONSTANTS) const uint LAYERS_PER_WG = 5;
+// Square of this many quads is covered by one workgroup
+layout(constant_id = NUM_GLOBAL_CONSTANTS + 1) const uint SLICE_SIZE_HALF = 6;
+
+const uint WG_SIZE = 64;
+layout(local_size_x = WG_SIZE) in;
+
+layout(push_constant) uniform ScanExtremaPc {
+    ExtremumLocations extremum_locations;
+    uint border;
+    float contrast_threshold;
+    float edgeness_cm_low;
+    float edgeness_cm_high;
+    uint skip_layers;
+    float min_scale;
+
+    uint width;
+    uint height;
+    uint max_extrema;
+
+    uint n_fine_levels;
+};
+
+const uint SCAN_AREA = 2 * (SLICE_SIZE_HALF + 2) - 2;
+
+const uint RINGBUF_LAYERS = 3;
+int layer_rb_idx;
+int rb_center_layer;
+
+const uint BUFFER_SIZE = 2 * int(SLICE_SIZE_HALF + 2);
+shared float sh_dog_ringbuf[RINGBUF_LAYERS][BUFFER_SIZE * BUFFER_SIZE];
+
+// How many local extrema i.e., samples that are larger/smaller than all their 26 neighbors.
+// (Pretty sure) the exact value is ceil(CX/2)*ceil(CY/2)*ceil(CZ/2) + floor(CX/2)*floor(CY/2)*floor(CZ/2),
+// generalized from the 1D case of a series like 1 0 1 0 1 0, where every value is a local min/max.
+// That's a lot though so 
+const uint max_wg_extrema = 32;
+
+shared uint sh_n_extrema;
+shared float sh_extremum_x[max_wg_extrema];
+shared float sh_extremum_y[max_wg_extrema];
+shared float sh_extremum_scale[max_wg_extrema];
+shared float sh_extremum_contrast[max_wg_extrema];
+
+ivec3 wg_coords = (ivec3(gl_WorkGroupID) * ivec3(SCAN_AREA, SCAN_AREA, 1) 
+    + ivec3(border, border, skip_layers));
+
+$define[@DBG(arg); if (gl_WorkGroupID == uvec3(11, 11, 0) && gl_LocalInvocationIndex == 11) { printf(@arg); }]
+
+vec4 load_quad(ivec3 v) {
+    const vec3 coords = vec3(
+        float(v.x) / width,
+        float(v.y) / height,
+        float(v.z)
+    );
+    return textureGather(sampler2DArray(texture_coarse, @sampler_bil), coords);
+}
+
+
+// z is offset to largest scale in ringbuf layer that has one before and one after, so the last index - 1
+float at(int z, int y, int x) {
+    @ASSERT(-1 <= y && y < int(BUFFER_SIZE-1); "x=%d   y=%d"; x, y);
+    @ASSERT(-1 <= x && x < int(BUFFER_SIZE-1); "x=%d   y=%d"; x, y);
+    const uint layer = uint(int(rb_center_layer) + int(RINGBUF_LAYERS) + z) % RINGBUF_LAYERS;
+
+    // +2 because we're wasting one perimeter of pixels right now
+    const uint idx = (y + 1) * BUFFER_SIZE + x + 1;
+    @ASSERT(0 <= idx && idx < BUFFER_SIZE * BUFFER_SIZE; "%d"; idx);
+
+    return sh_dog_ringbuf[layer][idx];
+}
+
+bool is_extremum(const int x, const int y, const int z) {
+    bool a = true;
+    const float val = at(z, y, x);
+    if (abs(val) <= contrast_threshold) {
+        a = false;
+    }
+    const float sgn = sign(val);
+    if (a) {
+        a =
+            sgn * val >= sgn * at(z - 1, y - 1 , x - 1)
+            && sgn * val >= sgn * at(z - 1, y - 1 , x - 0)
+            && sgn * val >= sgn * at(z - 1, y - 1 , x + 1)
+            && sgn * val >= sgn * at(z - 1, y + 0 , x - 1)
+            && sgn * val >= sgn * at(z - 1, y + 0 , x + 0)
+            && sgn * val >= sgn * at(z - 1, y + 0 , x + 1)
+            && sgn * val >= sgn * at(z - 1, y + 1 , x - 1)
+            && sgn * val >= sgn * at(z - 1, y + 1 , x + 0)
+            && sgn * val >= sgn * at(z - 1, y + 1 , x + 1)
+            && sgn * val >= sgn * at(z + 0, y - 1 , x - 1)
+            && sgn * val >= sgn * at(z + 0, y - 1 , x - 0)
+            && sgn * val >= sgn * at(z + 0, y - 1 , x + 1)
+            && sgn * val >= sgn * at(z + 0, y + 0 , x - 1)
+            && sgn * val >= sgn * at(z + 0, y + 0 , x + 1)
+            && sgn * val >= sgn * at(z + 0, y + 1 , x - 1)
+            && sgn * val >= sgn * at(z + 0, y + 1 , x + 0)
+            && sgn * val >= sgn * at(z + 0, y + 1 , x + 1)
+            && sgn * val >= sgn * at(z + 1, y - 1 , x - 1)
+            && sgn * val >= sgn * at(z + 1, y - 1 , x - 0)
+            && sgn * val >= sgn * at(z + 1, y - 1 , x + 1)
+            && sgn * val >= sgn * at(z + 1, y + 0 , x - 1)
+            && sgn * val >= sgn * at(z + 1, y + 0 , x + 0)
+            && sgn * val >= sgn * at(z + 1, y + 0 , x + 1)
+            && sgn * val >= sgn * at(z + 1, y + 1 , x - 1)
+            && sgn * val >= sgn * at(z + 1, y + 1 , x + 0)
+            && sgn * val >= sgn * at(z + 1, y + 1 , x + 1);
+    }
+    return a;
+}
+
+void check_extremum(int x, int y, int fine_scale) {
+    int z = 0;
+    const int abs_x = x + wg_coords.x;
+    const int abs_y = y + wg_coords.y;
+    if (abs_x >= width - border || abs_y >= height - border) {
+        return;
+    }
+    if (is_extremum(x, y, z)) {
+        const float dds = (at(z+1, y, x) - at(z-1, y, x)) / 2.0;
+        const float ddy = (at(z, y+1, x) - at(z, y-1, x)) / 2.0;
+        const float ddx = (at(z, y, x+1) - at(z, y, x-1)) / 2.0;
+
+        const float value2x = at(z, y, x) * 2.0;
+        // d2/ds2
+        const float h11 = at(z+1, y, x) + at(z-1, y, x) - value2x;
+        // d2/dy2
+        const float h22 = at(z, y+1, x) + at(z, y-1, x) - value2x;
+        // d2/dx2
+        const float h33 = at(z, y, x+1) + at(z, y, x-1) - value2x;
+        // d2/dyds
+        const float h12 = (at(z+1, y+1, x) - at(z-1, y+1, x) - at(z+1, y-1, x) + at(z-1, y-1, x)) / 4.0;
+        // d2/dxds
+        const float h13 = (at(z+1, y, x+1) - at(z-1, y, x+1) - at(z+1, y, x-1) + at(z-1, y, x-1)) / 4.0;
+        // d2/dxdy
+        const float h23 = (at(z, y+1, x+1) - at(z, y+1, x-1) - at(z, y-1, x+1) + at(z, y-1, x-1)) / 4.0;
+
+
+        const float det = h11 * h22 * h33 - h11 * h23 * h23 - h12 * h12 * h33 + 2. * h12 * h13 * h23
+            - h13 * h13 * h22;
+        const float hinv11 = (h22 * h33 - h23 * h23) / det;
+        const float hinv12 = (h13 * h23 - h12 * h33) / det;
+        const float hinv13 = (h12 * h23 - h13 * h22) / det;
+        const float hinv22 = (h11 * h33 - h13 * h13) / det;
+        const float hinv23 = (h12 * h13 - h11 * h23) / det;
+        const float hinv33 = (h11 * h22 - h12 * h12) / det;
+
+        const float offset_scale = -(hinv11 * dds + hinv12 * ddy + hinv13 * ddx);
+        const float offset_y     = -(hinv12 * dds + hinv22 * ddy + hinv23 * ddx);
+        const float offset_x     = -(hinv13 * dds + hinv23 * ddy + hinv33 * ddx);
+
+
+        const float denom = (h22 + h33) * (h22 + h33);
+        const float cm = 1 - 4 * (h22 * h33 - h23 * h23) / denom;
+
+        if (abs(offset_x) > 0.5 || abs(offset_y) > 0.5 || abs(offset_scale) > 0.5) {
+            // x = int(round(x + offset_x));
+            // y = int(round(y + offset_y));
+            // z = int(round(z + offset_scale));
+            // TODO: if we have those pixels try interpolating again. especially at larger scales you lose feature here
+            return;
+        } 
+
+        const float interp_value = offset_scale * dds + offset_y * ddy + offset_x * ddx;
+
+        const float contrast = abs(at(z, y, x) + interp_value / 2.0);
+        // This contrast can't be lower than the threshold here, since interpolating the extremum position
+        // only increases the DoG response. 
+        // You could have two thresholds though, one pre- and one post-interpolation if that's ever desired.
+        // if (contrast < contrast_threshold) {
+        //     return;
+        // }
+
+        // Check extremum edgeness  with hessian anisotropy criterion
+        if (denom == 0 || (edgeness_cm_low <= cm && cm <= edgeness_cm_high)) {
+            return;
+        }
+
+        // SIFT edge rejection. Also works 
+        // const float edgeness = (h22 + h33) * (h22 + h33) / ((h22 * h33) - (h12 * h23));
+        // if (edgeness > 14.0) {
+        //     return;
+        // }
+
+        float size = DOG_FIRST_SCALE_SIGMA * DOG_SIGMA_RADIUS_FACTOR * pow(2.0, float(z) + fine_scale + offset_scale);
+        if (size < min_scale) {
+            return;
+        }
+
+        const uint extremum_idx = atomicAdd(sh_n_extrema, 1);
+        if (extremum_idx < max_wg_extrema) {
+            const float extremum_x = float(wg_coords.x + x) + offset_x;
+            const float extremum_y = float(wg_coords.y + y) + offset_y;
+            sh_extremum_x[extremum_idx] = extremum_x;
+            sh_extremum_y[extremum_idx] = extremum_y;
+            sh_extremum_scale[extremum_idx] = size;
+            sh_extremum_contrast[extremum_idx] = contrast;
+        }
+    }
+}
+
+void write_quad_to_ringbuffer(vec4 quad, uint layer, uint x, uint y) {
+    // bl br tr tl
+    const uint row = 2 * y * BUFFER_SIZE;
+    sh_dog_ringbuf[layer][row + 2 * x] = float(quad.w); 
+    sh_dog_ringbuf[layer][row + 2 * x + 1] = float(quad.z); 
+    sh_dog_ringbuf[layer][row + BUFFER_SIZE + 2 * x] = float(quad.x); 
+    sh_dog_ringbuf[layer][row + BUFFER_SIZE + 2 * x + 1] = float(quad.y);
+}
+
+
+float normalize_factor(int scale) {
+    return pow(2, scale);
+}
+
+float vec4_max(vec4 v) {
+    return max(v.x, max(v.y, max(v.z, v.w)));
+}
+
+float vec4_min(vec4 v) {
+    return min(v.x, min(v.y, min(v.z, v.w)));
+}
+
+bvec4 vec4_and(bvec4 a, bvec4 b) {
+    return bvec4(a[0] && b[0], a[1] && b[1], a[2] && b[2], a[3] && b[3]);
+}
+
+bvec4 vec4_or(bvec4 a, bvec4 b) {
+    return bvec4(a[0] || b[0], a[1] || b[1], a[2] || b[2], a[3] || b[3]);
+}
+
+uint abs_argmax(vec4 v) {
+    int m = 5;
+    float cur = 0;
+    for (int i = 0; i < 4; i++) {
+        if (abs(v[i]) > max(abs(cur), contrast_threshold)) {
+            cur = v[i];
+            m = i;
+        }
+    }
+    return m;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0) {
+        sh_n_extrema = 0;
+    }
+
+    const int wg_quad_x = int(gl_LocalInvocationIndex % (SLICE_SIZE_HALF + 2));
+    const int wg_quad_y = int(gl_LocalInvocationIndex / (SLICE_SIZE_HALF + 2));
+    // -1 because of the halo rows, +1 for textureGather to be inbetween texels
+    const int load_quad_x = 2 * wg_quad_x - 1 + 1;
+    const int load_quad_y = 2 * wg_quad_y - 1 + 1;
+
+    layer_rb_idx = 0;
+    vec4 prev_scale_quad = load_quad(wg_coords + ivec3(load_quad_x, load_quad_y, 0));
+    uint running_abs_argmax = 0;
+
+    [[unroll]]
+    for (int i = int(skip_layers); i < int(skip_layers) + 3; i++) {
+        // FIXME: handle skip_layers here, make sure fine_scale idx is correct
+        const vec4 quad = load_quad(wg_coords + ivec3(load_quad_x, load_quad_y, i + 1));
+        const vec4 dog = (quad - prev_scale_quad) * normalize_factor(i);
+
+        write_quad_to_ringbuffer(dog, layer_rb_idx, wg_quad_x, wg_quad_y);
+        layer_rb_idx = (layer_rb_idx + 1) % int(RINGBUF_LAYERS);
+
+        running_abs_argmax <<= 4;
+        running_abs_argmax |= abs_argmax(dog);
+        prev_scale_quad = quad;
+    }
+
+    rb_center_layer = 1;
+    barrier();
+
+    for (int fine_scale = 1 + int(skip_layers); fine_scale < n_fine_levels - 1; fine_scale++) {
+        vec4 next_scale_quad;
+        if (fine_scale + 2 < n_fine_levels) {
+           next_scale_quad = load_quad(wg_coords + ivec3(load_quad_x, load_quad_y, fine_scale + 3));
+        }
+
+        uint check = (running_abs_argmax >> 4) & 0xf;
+        if (check < 4) {
+            int x = (check == 0 || check == 3) ? -1 : 0;
+            int y = (check == 2 || check == 3) ? -1 : 0;
+            const int xx = 2 * wg_quad_x + x;
+            const int yy = 2 * wg_quad_y + y;
+            if (xx >= 0 && xx < SCAN_AREA && yy >= 0 && yy < SCAN_AREA) {
+                check_extremum(xx, yy, fine_scale);
+            }
+        }
+
+        if (fine_scale + 2 < n_fine_levels) {
+            const vec4 dog = (next_scale_quad - prev_scale_quad) * normalize_factor(fine_scale + 2);
+            running_abs_argmax <<= 4;
+            running_abs_argmax |= abs_argmax(dog);
+
+            // Don't overwrite while others might still be reading
+            barrier();
+            write_quad_to_ringbuffer(dog, layer_rb_idx, wg_quad_x, wg_quad_y);
+            layer_rb_idx = (layer_rb_idx + 1) % int(RINGBUF_LAYERS);
+            prev_scale_quad = next_scale_quad;
+        } 
+        rb_center_layer = (rb_center_layer + 1) % int(RINGBUF_LAYERS);
+        barrier();
+    }
+
+    const uint n_extrema = sh_n_extrema;
+    barrier();
+    if (gl_LocalInvocationIndex == 0) {
+        const uint first_extremum_idx = atomicAdd(extremum_locations.n_extrema, n_extrema);
+        sh_n_extrema = first_extremum_idx;
+    }
+    barrier();
+    const int space_left = int(max_extrema) - int(sh_n_extrema);
+    if (space_left > 0) {
+        for (uint i = gl_LocalInvocationIndex; i < min(uint(space_left), n_extrema); i += WG_SIZE) {
+            const uint idx = sh_n_extrema + i;
+            set_extremum_x_float(extremum_locations, idx, sh_extremum_x[i]);
+            set_extremum_y_float(extremum_locations, idx, sh_extremum_y[i]);
+            set_extremum_scale_float(extremum_locations, idx, sh_extremum_scale[i]);
+            set_extremum_contrast(extremum_locations, idx, sh_extremum_contrast[i]);
+        }
+    }
+}

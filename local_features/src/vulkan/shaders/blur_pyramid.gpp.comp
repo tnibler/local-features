@@ -1,0 +1,55 @@
+$include["macros.gpp"]
+// TRIM_ABOVE
+#version 460
+#include "extensions.glsl"
+#include "common.gpp.glsl"
+#include "conv_pushconstants.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const float WEIGHTS[2] = {0.375, 0.3125};
+const float OFFSETS[2] = {0.0, 0.2};
+
+float sample_in(vec2 v, uint level) {
+    if (vertical_pass) {
+        return textureLod(sampler2D(@texture_patch_pyr_scratch, @sampler_bil), v, level).r;
+    } else {
+        return textureLod(sampler2D(@texture_patch_pyr, @sampler_bil), v, level).r;
+    }
+}
+
+void main() {
+    const uint in_width = width;
+    const uint in_height = height;
+
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+
+    const uint out_width = vertical_pass ? (in_width / 2) : in_width;
+    const uint out_height = vertical_pass ? (in_height / 2) : in_height;
+
+    if (x >= out_width || y >= out_height) {
+        return;
+    }
+
+    if (vertical_pass) {
+        const vec2 texture_size = textureSize(@texture_patch_pyr_scratch, 0);
+        const vec2 coords_in = vec2(2 * float(x) + 0.5, 2 * float(y) + 0.5) / texture_size;
+        const vec2 offset = vec2(0, (1.0 + OFFSETS[1])) / texture_size;
+        const float sum = 
+            sample_in(coords_in, 0) * WEIGHTS[0] 
+            + (sample_in(coords_in - offset, 0) + sample_in(coords_in + offset, 0)) * WEIGHTS[1];
+
+        imageStore(@image_patch_pyr_mip(in_level + 1), ivec2(x, y), vec4_FORMAT(sum, 0.0, 0.0, 1.0));
+    } else {
+        const vec2 texture_size = textureSize(@texture_patch_pyr, int(in_level));
+        const vec2 coords_in = vec2(float(x) + 0.5, float(y) + 0.5) / texture_size;
+
+        const vec2 offset = vec2(1.0 + OFFSETS[1], 0) / texture_size;
+        const float sum = 
+            sample_in(coords_in, in_level) * WEIGHTS[0]
+            + (sample_in(coords_in - offset, in_level) + sample_in(coords_in + offset, in_level)) * WEIGHTS[1];
+
+        imageStore(@image_patch_pyr_scratch, ivec2(x, y), vec4_FORMAT(sum, 0.0, 0.0, 1.0));
+    }
+} 

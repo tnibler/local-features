@@ -1,0 +1,58 @@
+#version 460
+#include "../extensions.glsl"
+#include "../common.gpp.glsl"
+
+const uint TILE_SIZE = 8;
+layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE, local_size_z = 1) in;
+
+layout(push_constant) uniform WhiteningPc {
+    ConstantData consts;
+    KeypointIndices keypoints;
+    RawDescriptorBuffer raw_descriptors;
+    DescriptorBuffer descriptors;
+};
+
+const uint ACC_SIZE = (TILE_SIZE * TILE_SIZE) / MIN_SUBGROUP_SIZE;
+shared float acc[ACC_SIZE];
+
+shared float sh_desc_block[TILE_SIZE * TILE_SIZE];
+shared float sh_mat_block[TILE_SIZE * TILE_SIZE];
+
+void main() {
+    const uint start_out_row = gl_WorkGroupID.y * TILE_SIZE;
+    const uint start_out_col = gl_WorkGroupID.x * TILE_SIZE;
+
+    const uint local_row = gl_LocalInvocationID.y;
+    const uint local_col = gl_LocalInvocationID.x;
+
+    const uint global_row = start_out_row + local_row;
+    const uint global_col = start_out_col + local_col;
+
+    float sum = 0.0;
+
+    for (uint tile_start = 0; tile_start < DESCRIPTOR_SIZE; tile_start += TILE_SIZE) {
+
+        uint row_desc = global_row;
+        uint col_desc = tile_start + local_col;
+        sh_desc_block[local_row * TILE_SIZE + local_col] = (col_desc < DESCRIPTOR_SIZE) ?
+            (raw_descriptors.patches[row_desc].data[col_desc] - consts.mean_vec[col_desc]) : 0;
+
+        uint row_mat = global_col;
+        uint col_mat = tile_start + local_row;
+        sh_mat_block[local_row * TILE_SIZE + local_col] = (col_mat < DESCRIPTOR_SIZE) ? consts.eigen_vecs[row_mat * DESCRIPTOR_SIZE + col_mat] : 0;
+
+        barrier();
+
+        if (global_row < min(keypoints.n_keypoints, MAX_KEYPOINTS)) { // FIXME: this should be rt_max_keypoints from push consts
+            for (uint k = 0; k < TILE_SIZE; k++) {
+                sum += sh_desc_block[local_row * TILE_SIZE + k] * sh_mat_block[k * TILE_SIZE + local_col];
+            }
+        }
+
+        barrier();
+    }
+
+    if (global_row < min(keypoints.n_keypoints, MAX_KEYPOINTS)) { // FIXME: this should be rt_max_keypoints from push consts
+        descriptors.patches[global_row].data[global_col] = sum;
+    }
+}

@@ -1,14 +1,28 @@
+$include["macros.gpp"]
+// TRIM_ABOVE
 #ifndef _COMMON_GLSL
 #define _COMMON_GLSL
 
 #include "extensions.glsl"
-#include <vulkano.glsl>
 #include "pixel_type.glsl"
+
+const float PI = 3.1415926538;
 
 layout (constant_id = 0) const uint MIN_SUBGROUP_SIZE = 8;
 layout (constant_id = 1) const uint MAX_EXTREMA = 1;
 layout (constant_id = 2) const uint MAX_KEYPOINTS = 1;
 layout (constant_id = 3) const uint EXTREMUM_BLOCK_LEN = 256;
+layout (constant_id = 4) const uint PATCH_PYRAMID_LEVELS = 5;
+#define NUM_GLOBAL_CONSTANTS 5
+
+layout(binding = 0, r32f) uniform image2DArray image_coarse; 
+layout(binding = 1) uniform texture2DArray texture_coarse; 
+// One image view for each pyramid mip level
+layout(binding = 2, r32f) uniform image2D images[2 + PATCH_PYRAMID_LEVELS]; 
+layout(binding = 3) uniform texture2D textures[3]; 
+layout(binding = 4) uniform sampler samplers[2]; 
+// layout(binding = 5) uniform {
+// } buffers;
 
 // detected blob radius = sqrt(2) * sigma_LoG = sqrt(2) * ratio * sigma_DoG * sqrt(log(ratio) / (ratio^2 - 1)) $, where ratio = 2, sigma_DoG = 0.6 (first blur, before SWT)
 // = 0.8157, but 0.82 works a bit better with all other constants in e.g., keypoint_orientation
@@ -33,8 +47,8 @@ const uint STRIDE_EMB_POLAR = DIMS_EMB_POLAR;
 const uint DESCRIPTOR_SIZE = DIMS_INPUT * (DIMS_EMB_CARTESIAN + DIMS_EMB_POLAR);
 layout(buffer_reference, std430, buffer_reference_align=4) readonly buffer ConstantData {
     float gradient_angle[PATCH_SIZE * PATCH_SIZE];
-    float embedding_polar[DIMS_EMB_POLAR * PATCH_SIZE * PATCH_SIZE];
-    float embedding_cartesian[DIMS_EMB_CARTESIAN * PATCH_SIZE * PATCH_SIZE];
+    float embedding_polar[10 * PATCH_SIZE * PATCH_SIZE];
+    // float embedding_cartesian[DIMS_EMB_CARTESIAN * PATCH_SIZE * PATCH_SIZE];
     float mean_vec[DESCRIPTOR_SIZE];
     float eigen_vecs[DESCRIPTOR_SIZE * PCAD_DESCRIPTOR_SIZE];
 };
@@ -42,7 +56,7 @@ layout(buffer_reference, std430, buffer_reference_align=4) readonly buffer Const
 // == Scale space extremum detection ==
 
 // NOTE: readback depends on field order here, careful when changing things
-layout(buffer_reference, scalar, buffer_reference_align=4) buffer ExtremumLocations {
+layout(buffer_reference, std430, buffer_reference_align=4) buffer ExtremumLocations {
     // Counter incremented extremum scanning stage. Counts valid entries in data
     // detect: output, size of extremum_{scale,x,y,contrast}
     uint n_extrema;
@@ -80,7 +94,7 @@ float get_extremum_contrast(ExtremumLocations buf, uint i)  { return uintBitsToF
 void set_extremum_contrast(ExtremumLocations buf, uint i, float c) { buf.data[_coord_idx(i, 3)] = floatBitsToUint(c); }
 
 // Written by host
-layout(buffer_reference, scalar, buffer_reference_align=4) readonly buffer FilteredExtrema {
+layout(buffer_reference, std430, buffer_reference_align=4) readonly buffer FilteredExtrema {
     uint n_filtered_extrema;
     // Indices into extremum_locations
     // size: n_filtered_extrema
@@ -90,7 +104,7 @@ layout(buffer_reference, scalar, buffer_reference_align=4) readonly buffer Filte
 // == Descriptor extraction ==
 
 // Written by keypoint_orientation stage
-layout(buffer_reference, scalar, buffer_reference_align=4) buffer KeypointIndices {
+layout(buffer_reference, std430, buffer_reference_align=4) buffer KeypointIndices {
     uint n_keypoints;
     uint _pad[15];
 
@@ -105,7 +119,7 @@ struct Patch {
 };
 
 // Written by patch_gradients stage
-layout(buffer_reference, scalar, buffer_reference_align=4) buffer PatchBuffer {
+layout(buffer_reference, std430, buffer_reference_align=4) buffer PatchBuffer {
     // size: 2 * MAX_KEYPOINTS
     // Order: Magnitude, Angle
     Patch patches[];
@@ -123,7 +137,7 @@ uint embedding_offset_cartesian(uint patch_idx, uint in_dim, uint emb_dim) {
 }
 
 // Written by embedding stage
-layout(buffer_reference, scalar, buffer_reference_align=4) buffer EmbeddingBuffer {
+layout(buffer_reference, std430, buffer_reference_align=4) buffer EmbeddingBuffer {
     // Layout:
     // Polar: MAX_KEYPOINTS * DIMS_INPUT * STRIDE_EMB_POLAR
     // Cartesian: MAX_KEYPOINTS * DIMS_INPUT * STRIDE_EMB_CARTESIAN
@@ -134,7 +148,7 @@ struct RawDescriptor {
     float data[DESCRIPTOR_SIZE];
 };
 
-layout(buffer_reference, scalar, buffer_reference_align=4) buffer RawDescriptorBuffer {
+layout(buffer_reference, std430, buffer_reference_align=4) buffer RawDescriptorBuffer {
     RawDescriptor[] patches;
 };
 
@@ -142,7 +156,15 @@ struct Descriptor {
     float data[PCAD_DESCRIPTOR_SIZE];
 };
 
-layout(buffer_reference, scalar, buffer_reference_align=4) buffer DescriptorBuffer {
+layout(buffer_reference, std430, buffer_reference_align=4) buffer DescriptorBuffer {
     Descriptor[] patches;
+};
+
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Vec4Buf {
+    vec4 data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align=4) buffer FloatBuf {
+    float data[];
 };
 #endif // _COMMON_GLSL

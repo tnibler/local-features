@@ -1200,6 +1200,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "float-cmp"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "float-ord"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1902,7 +1911,6 @@ version = "0.1.0"
 dependencies = [
  "byte-slice-cast",
  "bytemuck",
- "criterion",
  "float-ord",
  "fxhash",
  "image",
@@ -1913,6 +1921,7 @@ dependencies = [
  "ndarray",
  "nshare",
  "order-stat",
+ "renderdoc",
  "safetensors",
  "thiserror 2.0.17",
  "vulkano",
@@ -1966,6 +1975,8 @@ dependencies = [
  "log",
  "ndarray",
  "nshare",
+ "pico-args",
+ "renderdoc",
 ]
 
 [[package]]
@@ -2725,6 +2736,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pico-args"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
+
+[[package]]
 name = "pin-project"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3138,6 +3155,21 @@ name = "regex-syntax"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caf4aa5b0f434c91fe5c7f1ecb6a5ece2130b02ad2a590589dda5146df959001"
+
+[[package]]
+name = "renderdoc"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac633a08f39bf3268714799bd8c4a1a19c19c203d817d3448bb8b91c97817cf0"
+dependencies = [
+ "bitflags 2.9.4",
+ "float-cmp",
+ "libloading",
+ "once_cell",
+ "renderdoc-sys",
+ "winapi",
+ "wio",
+]
 
 [[package]]
 name = "renderdoc-sys"
@@ -3849,7 +3881,7 @@ dependencies = [
 [[package]]
 name = "vulkano"
 version = "0.35.0"
-source = "git+https://github.com/vulkano-rs/vulkano?rev=37c36b5af107f08a6173cce12146c54a75dd56b4#37c36b5af107f08a6173cce12146c54a75dd56b4"
+source = "git+https://github.com/vulkano-rs/vulkano?rev=36c85057884f1684ed671976228046f415710d98#36c85057884f1684ed671976228046f415710d98"
 dependencies = [
  "ash",
  "bytemuck",
@@ -3869,7 +3901,7 @@ dependencies = [
 [[package]]
 name = "vulkano-macros"
 version = "0.35.0"
-source = "git+https://github.com/vulkano-rs/vulkano?rev=37c36b5af107f08a6173cce12146c54a75dd56b4#37c36b5af107f08a6173cce12146c54a75dd56b4"
+source = "git+https://github.com/vulkano-rs/vulkano?rev=36c85057884f1684ed671976228046f415710d98#36c85057884f1684ed671976228046f415710d98"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3880,7 +3912,7 @@ dependencies = [
 [[package]]
 name = "vulkano-shaders"
 version = "0.35.0"
-source = "git+https://github.com/vulkano-rs/vulkano?rev=37c36b5af107f08a6173cce12146c54a75dd56b4#37c36b5af107f08a6173cce12146c54a75dd56b4"
+source = "git+https://github.com/vulkano-rs/vulkano?rev=36c85057884f1684ed671976228046f415710d98#36c85057884f1684ed671976228046f415710d98"
 dependencies = [
  "foldhash 0.1.5",
  "heck 0.4.1",
@@ -3894,7 +3926,7 @@ dependencies = [
 [[package]]
 name = "vulkano-taskgraph"
 version = "0.35.0"
-source = "git+https://github.com/vulkano-rs/vulkano?rev=37c36b5af107f08a6173cce12146c54a75dd56b4#37c36b5af107f08a6173cce12146c54a75dd56b4"
+source = "git+https://github.com/vulkano-rs/vulkano?rev=36c85057884f1684ed671976228046f415710d98#36c85057884f1684ed671976228046f415710d98"
 dependencies = [
  "ash",
  "bytemuck",
@@ -4693,6 +4725,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21a0236b59786fed61e2a80582dd500fe61f18b5dca67a4a067d0bc9039339cf"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wio"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d129932f4644ac2396cb456385cbf9e63b5b30c6e8dc4820bdca4eb082037a5"
+dependencies = [
+ "winapi",
 ]
 
 [[package]]

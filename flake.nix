@@ -70,6 +70,7 @@
               shaderc
               llvmPackages.libclang.lib
               vulkan-headers
+              gpp
             ];
 
             VULKAN_SDK = "${targetPkgs.vulkan-headers}";
@@ -183,6 +184,7 @@
             packages = with pkgs; [
               toolchain
 
+              gpp
               vulkan-tools
               vulkan-tools-lunarg
               vulkan-validation-layers
@@ -197,7 +199,7 @@
               xorg.libXau
               xorg.libXdmcp
               libxkbcommon
-              shader-slang
+              renderdoc
             ];
 
             buildInputs = [vulkanSift];
@@ -212,8 +214,10 @@
 
               VULKANSIFT_LIB_PATH = "${vulkanSift}/lib";
               VULKANSIFT_INCLUDE_PATH = "${vulkanSift}/include";
+              RENDERDOC_LAYER_PATH = "${pkgs.renderdoc}/share/vulkan/implicit_layer.d/";
 
               LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
+                renderdoc
                 shaderc
                 vulkan-loader
                 vulkan-validation-layers

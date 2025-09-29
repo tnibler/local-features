@@ -2,15 +2,17 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use vulkano::{
+    descriptor_set::layout::{
+        DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType,
+    },
     memory::allocator::DeviceLayout,
     pipeline::{
-        ComputePipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+        ComputePipeline, PipelineLayout, PipelineShaderStageCreateFlags, PipelineShaderStageCreateInfo,
         compute::ComputePipelineCreateInfo,
         layout::{PipelineLayoutCreateInfo, PushConstantRange},
     },
     shader::{ShaderStages, SpecializationConstant},
 };
-use vulkano_taskgraph::descriptor_set::BindlessContext;
 
 use crate::vulkan::Vulkan;
 
@@ -22,52 +24,63 @@ pub mod shaders_f32 {
         define: [("PRECISION_FLOAT32", "1")],
         shaders: {
             blur: {
-                path: "src/vulkan/shaders/blur.glsl",
+                path: "src/vulkan/shaders_build/blur.gpp.comp",
+                ty: "compute",
+            },
+            swt_dense: {
+                path: "src/vulkan/shaders_build/blur.gpp.comp",
+                ty: "compute",
+                define: [("BINOMIAL_FILTER", "1")],
+            },
+            swt_sparse1: {
+                path: "src/vulkan/shaders_build/swt_sparse1.gpp.comp",
+                ty: "compute",
+            },
+            swt_sparse2: {
+                path: "src/vulkan/shaders_build/swt_sparse.gpp.comp",
                 ty: "compute",
             },
             swt: {
-                path: "src/vulkan/shaders/swt.glsl",
-                ty: "compute",
-            },
-            swt_sub: {
-                path: "src/vulkan/shaders/swt_sub.glsl",
+                path: "src/vulkan/shaders_build/swt.gpp.comp",
                 ty: "compute",
             },
             scan_extrema: {
                 ty: "compute",
-                path: "src/vulkan/shaders/scan_extrema.glsl",
+                path: "src/vulkan/shaders_build/scan_extrema.gpp.comp",
             },
             blur_pyramid: {
                 ty: "compute",
-                path: "src/vulkan/shaders/blur_pyramid.glsl",
+                path: "src/vulkan/shaders_build/blur_pyramid.gpp.comp",
             },
             keypoint_orientation: {
-                path: "src/vulkan/shaders/keypoint_orientation.glsl",
+                path: "src/vulkan/shaders_build/keypoint_orientation.gpp.comp",
                 ty: "compute",
             },
             patch_gradients: {
                 ty: "compute",
-                path: "src/vulkan/shaders/mkd/patch_gradients.glsl",
+                path: "src/vulkan/shaders_build/mkd/patch_gradients.gpp.comp",
             },
             embedding_polar: {
                 ty: "compute",
-                path: "src/vulkan/shaders/mkd/embedding_polar.glsl",
+                path: "src/vulkan/shaders_build/mkd/embedding_polar.gpp.comp",
+                // bytes: "embedding_polar.spv",
             },
             embedding_cartesian: {
                 ty: "compute",
-                path: "src/vulkan/shaders/mkd/embedding_cartesian.glsl",
+                path: "src/vulkan/shaders_build/mkd/embedding_cartesian.gpp.comp",
+                // bytes: "embedding_cartesian.spv",
             },
             normalize: {
                 ty: "compute",
-                path: "src/vulkan/shaders/mkd/normalize.glsl",
+                path: "src/vulkan/shaders_build/mkd/normalize.comp",
             },
             whitening: {
                 ty: "compute",
-                path: "src/vulkan/shaders/mkd/whitening.glsl",
+                path: "src/vulkan/shaders_build/mkd/whitening.comp",
             },
             normalize_final: {
                 ty: "compute",
-                path: "src/vulkan/shaders/mkd/normalize_final.glsl",
+                path: "src/vulkan/shaders_build/mkd/normalize_final.comp",
             },
         },
     }
@@ -76,7 +89,9 @@ pub mod shaders_f32 {
 pub struct ComputePipelines {
     pub blur: Arc<ComputePipeline>,
     pub swt: Arc<ComputePipeline>,
-    pub swtsub: Arc<ComputePipeline>,
+    pub swt_sparse1: Arc<ComputePipeline>,
+    pub swt_sparse2: Arc<ComputePipeline>,
+    pub swt_dense: Arc<ComputePipeline>,
     pub scan_extrema: Arc<ComputePipeline>,
     pub blur_pyramid: Arc<ComputePipeline>,
     pub keypoint_orientation: Arc<ComputePipeline>,
@@ -86,19 +101,12 @@ pub struct ComputePipelines {
     pub normalize: Arc<ComputePipeline>,
     pub whitening: Arc<ComputePipeline>,
     pub normalize_final: Arc<ComputePipeline>,
+
+    pub descriptor_set_layout: Arc<DescriptorSetLayout>,
 }
 
-pub fn create_pipelines(
-    params: &FixedParams,
-    vk: &Vulkan,
-    bcx: &BindlessContext,
-) -> Result<ComputePipelines, crate::vulkan::VulkanError> {
-    let min_subgroup_size = vk
-        .device
-        .physical_device()
-        .properties()
-        .min_subgroup_size
-        .expect("TODO what now");
+pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipelines, crate::vulkan::VulkanError> {
+    let min_subgroup_size = vk.device.physical_device().properties().min_subgroup_size.expect("TODO what now");
     let specialization_constants = [
         (0u32, SpecializationConstant::U32(min_subgroup_size)),
         // MAX_EXTREMA
@@ -107,6 +115,8 @@ pub fn create_pipelines(
         (2, SpecializationConstant::U32(params.max_keypoints)),
         // EXTREMUM_BLOCK_LEN
         (3, SpecializationConstant::U32(params.extremum_block_len)),
+        // PATCH_PYRAMID_LEVELS
+        (4, SpecializationConstant::U32(params.patch_pyr_levels)),
     ];
     const SPECIALIZATION_PANIC_MSG: &str = "Wrong specialization constants";
 
@@ -125,8 +135,10 @@ pub fn create_pipelines(
         }};
     }
     let blur_stage = shader_stage!(load_blur);
+    let swt_dense_stage = shader_stage!(load_swt_dense);
     let swt_stage = shader_stage!(load_swt);
-    let swtsub_stage = shader_stage!(load_swt_sub);
+    let swt_sparse1_stage = shader_stage!(load_swt_sparse1);
+    let swt_sparse2_stage = shader_stage!(load_swt_sparse2);
     let scan_extrema_stage = shader_stage!(load_scan_extrema);
     let blur_pyramid_stage = shader_stage!(load_blur_pyramid);
 
@@ -140,8 +152,10 @@ pub fn create_pipelines(
 
     let entry_points = [
         &blur_stage,
+        &swt_dense_stage,
         &swt_stage,
-        &swtsub_stage,
+        &swt_sparse1_stage,
+        &swt_sparse2_stage,
         &scan_extrema_stage,
         &blur_pyramid_stage,
         &keypoint_orientation_stage,
@@ -159,10 +173,51 @@ pub fn create_pipelines(
         .max_by_key(|pc| pc.size)
         .expect("there are >0 push constant ranges");
 
+    let n_storage_images = 2 + params.patch_pyr_levels;
+    let n_sampled_images = 2 + 1;
+
+    let descriptor_set_layout = DescriptorSetLayout::new(
+        &vk.device,
+        &DescriptorSetLayoutCreateInfo {
+            bindings: &[
+                // SWT blurred images
+                DescriptorSetLayoutBinding {
+                    stages: ShaderStages::COMPUTE,
+                    binding: 0,
+                    ..DescriptorSetLayoutBinding::new(DescriptorType::StorageImage)
+                },
+                DescriptorSetLayoutBinding {
+                    stages: ShaderStages::COMPUTE,
+                    binding: 1,
+                    ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
+                },
+                // Scratch image, patch pyramid
+                DescriptorSetLayoutBinding {
+                    stages: ShaderStages::COMPUTE,
+                    binding: 2,
+                    descriptor_count: n_storage_images,
+                    ..DescriptorSetLayoutBinding::new(DescriptorType::StorageImage)
+                },
+                DescriptorSetLayoutBinding {
+                    stages: ShaderStages::COMPUTE,
+                    binding: 3,
+                    descriptor_count: n_sampled_images,
+                    ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
+                },
+                DescriptorSetLayoutBinding {
+                    stages: ShaderStages::COMPUTE,
+                    binding: 4,
+                    descriptor_count: 2,
+                    ..DescriptorSetLayoutBinding::new(DescriptorType::Sampler)
+                },
+            ],
+            ..Default::default()
+        },
+    )?;
     let layout = PipelineLayout::new(
         &vk.device,
         &PipelineLayoutCreateInfo {
-            set_layouts: &[bcx.global_set_layout()],
+            set_layouts: &[&descriptor_set_layout],
             push_constant_ranges: &[PushConstantRange {
                 stages: ShaderStages::COMPUTE,
                 offset: 0,
@@ -171,21 +226,25 @@ pub fn create_pipelines(
             ..Default::default()
         },
     )?;
-
     let make_pipeline = |entry_point| {
         ComputePipeline::new(
             &vk.device,
             None,
             &ComputePipelineCreateInfo::new(
-                PipelineShaderStageCreateInfo::new(&entry_point),
+                PipelineShaderStageCreateInfo {
+                    flags: unsafe { std::mem::transmute::<u32, PipelineShaderStageCreateFlags>(1u32) },
+                    ..PipelineShaderStageCreateInfo::new(&entry_point)
+                },
                 &layout,
             ),
         )
     };
 
     let blur = make_pipeline(blur_stage)?;
+    let swt_dense = make_pipeline(swt_dense_stage)?;
     let swt = make_pipeline(swt_stage)?;
-    let swtsub = make_pipeline(swtsub_stage)?;
+    let swt_sparse1 = make_pipeline(swt_sparse1_stage)?;
+    let swt_sparse2 = make_pipeline(swt_sparse2_stage)?;
     let scan_extrema = make_pipeline(scan_extrema_stage)?;
     let blur_pyramid = make_pipeline(blur_pyramid_stage)?;
     let keypoint_orientation = make_pipeline(keypoint_orientation_stage)?;
@@ -198,8 +257,10 @@ pub fn create_pipelines(
 
     Ok(ComputePipelines {
         blur,
+        swt_dense,
+        swt_sparse1,
+        swt_sparse2,
         swt,
-        swtsub,
         scan_extrema,
         blur_pyramid,
         keypoint_orientation,
@@ -209,6 +270,8 @@ pub fn create_pipelines(
         normalize: embedding_sum,
         whitening,
         normalize_final: normalize,
+
+        descriptor_set_layout,
     })
 }
 
@@ -234,8 +297,7 @@ pub fn extremum_locations_buffer_layout(
     let size_extremum_locations = u64::from(4 * max_extrema) * elsize as u64;
     let size_total = (1u64 + 15) * elsize as u64 + size_extremum_locations;
     assert!(size_extremum_locations <= size_total);
-    let layout = DeviceLayout::from_size_alignment(size_total, 4u64)
-        .ok_or(crate::vulkan::VulkanError::TODO)?;
+    let layout = DeviceLayout::from_size_alignment(size_total, 4u64).ok_or(crate::vulkan::VulkanError::TODO)?;
     assert!(params.extremum_block_len > 0);
     Ok(ExtremumLocationsBufferLayout {
         offset_n_extrema,
@@ -270,31 +332,23 @@ impl ExtremumLocationsBufferLayout {
         let block_len = self.block_len;
         let full_blocks_end = n_full_blocks * N_COORDS * block_len;
         let tail = (n_tail_elems > 0).then(|| {
-            let (xs, ys, scales, contrasts) = &buffer
-                [full_blocks_end..full_blocks_end + N_COORDS * block_len]
+            let (xs, ys, scales, contrasts) = &buffer[full_blocks_end..full_blocks_end + N_COORDS * block_len]
                 .chunks_exact(block_len)
                 .map(|chunk| &chunk[..n_tail_elems])
                 .collect_tuple()
                 .unwrap();
 
-            BlobLocationsView {
-                xs,
-                ys,
-                scales,
-                contrasts,
-            }
+            assert_eq!(xs.len(), n_tail_elems);
+            assert_eq!(ys.len(), n_tail_elems);
+            assert_eq!(scales.len(), n_tail_elems);
+            assert_eq!(contrasts.len(), n_tail_elems);
+            BlobLocationsView { xs, ys, scales, contrasts }
         });
         buffer[..full_blocks_end]
             .chunks_exact(N_COORDS * block_len)
             .map(move |block| {
-                let (xs, ys, scales, contrasts) =
-                    block.chunks_exact(block_len).collect_tuple().unwrap();
-                BlobLocationsView {
-                    xs,
-                    ys,
-                    scales,
-                    contrasts,
-                }
+                let (xs, ys, scales, contrasts) = block.chunks_exact(block_len).collect_tuple().unwrap();
+                BlobLocationsView { xs, ys, scales, contrasts }
             })
             .chain(tail)
     }
@@ -321,9 +375,7 @@ pub struct KeypointsBufferLayout {
     pub layout: DeviceLayout,
 }
 
-pub fn keypoints_buffer_layout(
-    params: &FixedParams,
-) -> Result<KeypointsBufferLayout, crate::vulkan::VulkanError> {
+pub fn keypoints_buffer_layout(params: &FixedParams) -> Result<KeypointsBufferLayout, crate::vulkan::VulkanError> {
     let max_keypoints = params.max_keypoints;
 
     let elsize = size_of::<u32>();
@@ -335,8 +387,7 @@ pub fn keypoints_buffer_layout(
     let size_keypoints = u64::from(2 * max_keypoints) * elsize as u64;
     let size_total = (1u64 + 15) * elsize as u64 + size_keypoints;
     assert!(size_keypoints <= size_total);
-    let layout = DeviceLayout::from_size_alignment(size_total, 4u64)
-        .ok_or(crate::vulkan::VulkanError::TODO)?;
+    let layout = DeviceLayout::from_size_alignment(size_total, 4u64).ok_or(crate::vulkan::VulkanError::TODO)?;
     Ok(KeypointsBufferLayout {
         offset_n_keypoints,
         offset_extremum_indices,
@@ -356,7 +407,6 @@ pub fn filtered_extrema_buffer_layout(
     params: &FixedParams,
 ) -> Result<FilteredExtremaBufferLayout, crate::vulkan::VulkanError> {
     let size_total = u64::from(1 + params.max_extrema) * size_of::<u32>() as u64;
-    let layout =
-        DeviceLayout::from_size_alignment(size_total, 4).ok_or(crate::vulkan::VulkanError::TODO)?;
+    let layout = DeviceLayout::from_size_alignment(size_total, 4).ok_or(crate::vulkan::VulkanError::TODO)?;
     Ok(FilteredExtremaBufferLayout { layout, size_total })
 }

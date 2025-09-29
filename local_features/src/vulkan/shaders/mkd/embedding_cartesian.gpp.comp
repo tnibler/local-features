@@ -1,0 +1,182 @@
+$include["../macros.gpp"]
+// TRIM_ABOVE
+#version 460
+#include "../extensions.glsl"
+#extension GL_EXT_spirv_intrinsics: enable
+#extension GL_EXT_buffer_reference_uvec2 : require
+#include "../common.gpp.glsl"
+#include "swizzle.gpp.glsl"
+#include "embedding_common.glsl"
+
+#define EMBEDDING_CARTESIAN
+
+#if defined(EMBEDDING_POLAR) && !defined(EMBEDDING_CARTESIAN)
+
+const uint N_FOURIER_COEFFS = 3;
+// N=2, kappa=8
+const float FOURIER_COEFFS[N_FOURIER_COEFFS] = {0.37872374, 0.51796234, 0.46882015}
+
+#elif !defined(EMBEDDING_POLAR) && defined(EMBEDDING_CARTESIAN)
+
+const uint N_FOURIER_COEFFS = 2;
+// N=1, kappa=1
+const float FOURIER_COEFFS[N_FOURIER_COEFFS] = {0.618176, 0.6934725};
+
+#else 
+#error "Must define EMBEDDING_POLAR xor EMBEDDING_CARTESIAN"
+#endif
+
+
+const uint N_FREQS = N_FOURIER_COEFFS - 1;
+const uint N_COMPONENTS = 2 * N_FREQS + 1;
+const uint DIMS_EMB = N_COMPONENTS * N_COMPONENTS;
+const uint DIMS_EMB_STRIDE = DIMS_EMB;
+
+const uint WG_SIZE = 64;
+layout(local_size_x = WG_SIZE) in;
+
+const uint MAX_NUM_SUBGROUPS = WG_SIZE/ MIN_SUBGROUP_SIZE;
+
+layout(push_constant) uniform EmbedPc {
+    KeypointIndices keypoints;
+    ConstantData consts;
+    PatchBuffer patch_gradients;
+    EmbeddingBuffer embeddings;
+};
+
+vec4 get_embedding_coeff(uint dim, float ppos, bool is_y) {
+    @ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
+    if (dim == 0) {
+        return vec4(FOURIER_COEFFS[0]);
+    }
+    const float pos = ppos * PI / 2;
+    if (dim <= N_FREQS) {
+        // cos is symmetric, no sign flipping
+        return FOURIER_COEFFS[dim] * cos(dim * pos) * vec4(1);
+    } else {
+        // flip sign for right half if x, bottom half if y
+        const vec4 symmetry = is_y ? vec4(1, 1, -1, -1) : vec4(1, -1, 1, -1);
+        return FOURIER_COEFFS[dim - N_FREQS] * sin((dim - N_FREQS) * pos) * symmetry;
+    }
+}
+
+// FIXME: specialization const and tied to number of dispatch workgroups pls
+const uint IN_DIMS_PER_WG = 7;
+
+shared float sh_embeddings[IN_DIMS_PER_WG * DIMS_EMB * MAX_NUM_SUBGROUPS];
+
+void main() {
+    const uint patch_index = gl_WorkGroupID.x;
+    const uint wg_size = WG_SIZE;
+
+    if (patch_index >= min(MAX_KEYPOINTS, keypoints.n_keypoints)) {
+      return;
+    }
+
+    // Spread partial sums over thread registers. Small, if any speed improvement 
+    const uint ACC_PER_THREAD = 2;
+    uint SG_ACC_CAP = gl_SubgroupSize * ACC_PER_THREAD;
+    float my_acc[ACC_PER_THREAD] = { 0, 0 };
+
+    const uint start_in_dim = gl_WorkGroupID.y * IN_DIMS_PER_WG;
+    const uint end_in_dim = min(start_in_dim + IN_DIMS_PER_WG, DIMS_INPUT);
+    const uint n_in_dims = end_in_dim - start_in_dim;
+
+    float in_dim_vm_coeffs[IN_DIMS_PER_WG];
+    for (uint i = 0; i < n_in_dims; i++) {
+        in_dim_vm_coeffs[i] = von_mises_n3k8_coeff(i + start_in_dim);
+    }
+
+    for (uint i = gl_LocalInvocationIndex; i < (n_in_dims * DIMS_EMB * gl_NumSubgroups); i += WG_SIZE) {
+        sh_embeddings[i] = 0;
+    }
+    barrier();
+
+    uint acc_base_dim = 0;
+
+    for (uint load4_idx = gl_LocalInvocationIndex; load4_idx < PATCH_SIZE * PATCH_SIZE / 4; load4_idx += WG_SIZE) {
+        const uint scalar_index = 4 * load4_idx;
+        const uvec2 pos = unswizzle_index(scalar_index);
+        const float normalized_x = normalized_pos(pos.x);
+        const float normalized_y = normalized_pos(pos.y);
+        const float weight = gaussian_weight(normalized_x, normalized_y);
+        const vec4 embedded_mag = Vec4Buf(patch_gradients).data[patch_index * PATCH_SIZE * PATCH_SIZE / 4 + load4_idx];
+        const vec4 ori = Vec4Buf(patch_gradients).data[MAX_KEYPOINTS * PATCH_SIZE * PATCH_SIZE / 4 + patch_index * PATCH_SIZE * PATCH_SIZE / 4 + load4_idx];
+
+
+        for (uint wg_in_dim = 0, in_dim = start_in_dim; in_dim < end_in_dim; wg_in_dim++, in_dim++) {
+            vec4 embedded_grad = vec4(in_dim_vm_coeffs[wg_in_dim] * weight);
+            const bool need_ori = in_dim > 0;
+            if (need_ori) {
+                // n freqs for gradient match kernel
+                if (in_dim < 3 + 1) {
+                    embedded_grad *= cos(float(in_dim) * ori);
+                } else {
+                    embedded_grad *= sin(float(in_dim - 3) * ori);
+                }
+            }
+            embedded_grad *= embedded_mag;
+            for (uint dim_x = 0; dim_x < N_COMPONENTS; dim_x++) {
+                const vec4 coeff_x = get_embedding_coeff(dim_x, normalized_x, /* is_y */ false); // only need once not for every in_dim
+                for (uint dim_y = 0; dim_y < N_COMPONENTS; dim_y++) {
+                    const vec4 coeff_y = get_embedding_coeff(dim_y, normalized_y, /* is_y */ true);
+                    const vec4 result = embedded_grad * coeff_x * coeff_y;
+                    const float sum = result.x + result.y + result.z + result.w;
+
+                    const float sg_result = subgroupAdd(sum);
+                    const uint dim_idx = wg_in_dim * DIMS_EMB + dim_x * N_COMPONENTS + dim_y;
+
+                    if (dim_idx > 0 && dim_idx % SG_ACC_CAP == 0) {
+                        // flush in-register ringbuffer accumulator thingy
+                        for (int el = 0; el < ACC_PER_THREAD; el++) {
+                            const uint dim = (acc_base_dim + gl_SubgroupInvocationID * ACC_PER_THREAD + el) % (n_in_dims * DIMS_EMB);
+                            if (dim < n_in_dims * DIMS_EMB) {
+                                sh_embeddings[gl_SubgroupID * IN_DIMS_PER_WG * DIMS_EMB + dim] += my_acc[el];
+                            }
+                            my_acc[el] = 0;
+                        }
+                        acc_base_dim = dim_idx;
+                        barrier();
+                    }
+                    if (gl_SubgroupInvocationID == (dim_idx % SG_ACC_CAP) / ACC_PER_THREAD) {
+                        my_acc[dim_idx % ACC_PER_THREAD] += sg_result;
+                    }
+                }
+            }
+        }
+        if (n_in_dims * DIMS_EMB > SG_ACC_CAP) {
+            // Flush the remaining acc elements
+            for (int el = 0; el < ACC_PER_THREAD; el++) {
+                const uint dim = acc_base_dim + gl_SubgroupInvocationID * ACC_PER_THREAD + el;
+                if (dim < n_in_dims * DIMS_EMB) {
+                    sh_embeddings[gl_SubgroupID * IN_DIMS_PER_WG * DIMS_EMB + dim] += my_acc[el];
+                }
+                my_acc[el] = 0;
+            }
+            barrier();
+            acc_base_dim = 0;
+        }
+    }
+
+    for (int el = 0; el < ACC_PER_THREAD; el++) {
+        const uint dim = acc_base_dim + gl_SubgroupInvocationID * ACC_PER_THREAD + el;
+        if (dim < n_in_dims * DIMS_EMB) {
+            sh_embeddings[gl_SubgroupID * IN_DIMS_PER_WG * DIMS_EMB + dim] += my_acc[el];
+        }
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        for (uint sg = 1; sg < gl_NumSubgroups; sg++) {
+            for (uint dim = gl_SubgroupInvocationID; dim < n_in_dims * DIMS_EMB; dim += gl_SubgroupSize) {
+                sh_embeddings[dim] += sh_embeddings[sg * IN_DIMS_PER_WG * DIMS_EMB + dim];
+            }
+        }
+    }
+    barrier();
+
+    for (uint i = gl_LocalInvocationIndex; i < n_in_dims * DIMS_EMB; i += WG_SIZE) {
+        const uint offset = embedding_offset_cartesian(patch_index, start_in_dim, 0);
+        embeddings.data[offset + i] = sh_embeddings[i];
+    }
+}

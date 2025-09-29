@@ -6,7 +6,7 @@ use vulkano::{
     pipeline::{ComputePipeline, Pipeline},
 };
 use vulkano_taskgraph::{
-    Id, QueueFamilyType, Task,
+    Id, Task,
     command_buffer::{BlitImageInfo, ImageBlit},
     graph::{NodeId, TaskGraph},
     resource::{AccessTypes, ImageLayoutType},
@@ -18,89 +18,22 @@ struct PatchPyramidTask {
     in_level: u32,
     do_bind_pipeline: bool,
     direction: BlurDirection,
-    // FIXME: this should be runtime set in world, n_levels is max_n_levels there might be fewer
-    n_levels: u32,
     pipeline: Arc<ComputePipeline>,
 }
 
 pub struct PatchPyramidArgs {
-    pub coarse_image_id: Id<Image>,
     pub pyr_image_id: Id<Image>,
     pub tmp_image_id: Id<Image>,
-    // FIXME: this should be runtime set in world, n_levels is max_n_levels there might be fewer
     pub n_levels: u32,
 }
 
-// copy 0th coarse image to pyramid level 0
-// decimate 1st corase image to pyramid level 1
-// then recursively filter horizontal, filter and subsample vertical
-
 pub fn patch_pyramid_nodes(
-    PatchPyramidArgs {
-        coarse_image_id,
-        n_levels,
-        pyr_image_id,
-        tmp_image_id,
-    }: PatchPyramidArgs,
+    PatchPyramidArgs { n_levels, pyr_image_id, tmp_image_id }: PatchPyramidArgs,
     pipeline: Arc<ComputePipeline>,
     taskgraph: &mut TaskGraph<GlobalContext>,
 ) -> (NodeId, NodeId) {
-    assert!(n_levels > 1); // TODO: > or >= 1, and this shoudln't assert just do nothing if we don't have to
-
-    let copy0_node_id = taskgraph
-        .create_task_node(
-            "copy coarse image 0",
-            QueueFamilyType::Graphics,
-            BlitCopyImageTask {
-                vimg_src: coarse_image_id,
-                vimg_dst: pyr_image_id,
-                src_array_layer: 0,
-                dst_mip_level: 0,
-                half_size: false,
-            },
-        )
-        .image_access(
-            coarse_image_id,
-            AccessTypes::BLIT_TRANSFER_READ,
-            ImageLayoutType::General,
-        )
-        .image_access(
-            pyr_image_id,
-            AccessTypes::BLIT_TRANSFER_WRITE,
-            ImageLayoutType::General,
-        )
-        .build();
-
-    let decimate1_node_id = taskgraph
-        .create_task_node(
-            "decimate coarse image 1",
-            QueueFamilyType::Graphics,
-            BlitCopyImageTask {
-                vimg_src: coarse_image_id,
-                vimg_dst: pyr_image_id,
-                src_array_layer: 1,
-                dst_mip_level: 1,
-                half_size: true,
-            },
-        )
-        .image_access(
-            coarse_image_id,
-            AccessTypes::BLIT_TRANSFER_READ,
-            ImageLayoutType::General,
-        )
-        .image_access(
-            pyr_image_id,
-            AccessTypes::BLIT_TRANSFER_WRITE,
-            ImageLayoutType::General,
-        )
-        .build();
-
-    taskgraph
-        .add_edge(copy0_node_id, decimate1_node_id)
-        .unwrap();
-
-    let start_node = copy0_node_id;
-    let mut end_node = decimate1_node_id;
+    let mut start_node = None;
+    let mut connect_prev_node = None;
     for in_level in 1..n_levels - 1 {
         let horz_node_id = taskgraph
             .create_task_node(
@@ -110,21 +43,15 @@ pub fn patch_pyramid_nodes(
                     in_level,
                     do_bind_pipeline: in_level == 1,
                     direction: BlurDirection::Horizontal,
-                    n_levels,
                     pipeline: pipeline.clone(),
                 },
             )
-            .image_access(
-                pyr_image_id,
-                AccessTypes::COMPUTE_SHADER_SAMPLED_READ,
-                ImageLayoutType::General,
-            )
-            .image_access(
-                tmp_image_id,
-                AccessTypes::COMPUTE_SHADER_STORAGE_WRITE,
-                ImageLayoutType::General,
-            )
+            .image_access(pyr_image_id, AccessTypes::COMPUTE_SHADER_SAMPLED_READ, ImageLayoutType::General)
+            .image_access(tmp_image_id, AccessTypes::COMPUTE_SHADER_STORAGE_WRITE, ImageLayoutType::General)
             .build();
+        if start_node.is_none() {
+            start_node = Some(horz_node_id);
+        }
         let vert_node_id = taskgraph
             .create_task_node(
                 "patch pyramid horz",
@@ -133,26 +60,19 @@ pub fn patch_pyramid_nodes(
                     in_level,
                     direction: BlurDirection::Vertical,
                     do_bind_pipeline: false,
-                    n_levels,
                     pipeline: pipeline.clone(),
                 },
             )
-            .image_access(
-                tmp_image_id,
-                AccessTypes::COMPUTE_SHADER_SAMPLED_READ,
-                ImageLayoutType::General,
-            )
-            .image_access(
-                pyr_image_id,
-                AccessTypes::COMPUTE_SHADER_STORAGE_WRITE,
-                ImageLayoutType::General,
-            )
+            .image_access(tmp_image_id, AccessTypes::COMPUTE_SHADER_SAMPLED_READ, ImageLayoutType::General)
+            .image_access(pyr_image_id, AccessTypes::COMPUTE_SHADER_STORAGE_WRITE, ImageLayoutType::General)
             .build();
-        taskgraph.add_edge(end_node, horz_node_id).unwrap();
+        if let Some(node) = connect_prev_node {
+            taskgraph.add_edge(node, horz_node_id).unwrap();
+        }
         taskgraph.add_edge(horz_node_id, vert_node_id).unwrap();
-        end_node = vert_node_id;
+        connect_prev_node = Some(vert_node_id);
     }
-    (start_node, end_node)
+    (start_node.unwrap(), connect_prev_node.unwrap())
 }
 
 impl Task for PatchPyramidTask {
@@ -164,19 +84,12 @@ impl Task for PatchPyramidTask {
         _tcx: &mut vulkano_taskgraph::TaskContext<'_>,
         world: &Self::World,
     ) -> vulkano_taskgraph::TaskResult {
-        assert_eq!(
-            self.n_levels as usize,
-            world.physical_resources.stor_patch_pyr.len()
-        ); // TODO: n_levels is more like max_n_levels and must be <= world.pyr.len()
         if self.in_level >= world.rt_patch_pyr_levels {
             return Ok(());
         }
         let in_width = world.image_width / 2u32.pow(self.in_level);
         let in_height = world.image_height / 2u32.pow(self.in_level);
-        trace!(
-            "Blur in_level: {} ({:?}), {}x{}",
-            self.in_level, self.direction, in_width, in_height
-        );
+        trace!("Patch Pyramid Blur, in_level: {} ({:?}), {}x{}", self.in_level, self.direction, in_width, in_height);
         if self.do_bind_pipeline {
             unsafe {
                 cbf.bind_pipeline_compute(&self.pipeline)?;
@@ -186,23 +99,12 @@ impl Task for PatchPyramidTask {
             cbf.push_constants(
                 self.pipeline.layout(),
                 0,
-                &shaders::shaders_f32::BlurPyramidPc {
+                &shaders::shaders_f32::ConvPc {
                     vertical_pass: match self.direction {
                         BlurDirection::Vertical => 1,
-                        _ => 0,
+                        BlurDirection::Horizontal => 0,
                     },
                     in_level: self.in_level,
-                    in_sampler_id: world.physical_resources.sampler,
-                    in_texture_id: match self.direction {
-                        BlurDirection::Horizontal => world.physical_resources.samp_patch_pyr,
-                        BlurDirection::Vertical => world.physical_resources.samp_patch_pyr_tmp,
-                    },
-                    out_image_id: match self.direction {
-                        BlurDirection::Horizontal => world.physical_resources.stor_patch_pyr_tmp,
-                        BlurDirection::Vertical => {
-                            world.physical_resources.stor_patch_pyr[self.in_level as usize + 1]
-                        }
-                    },
                     width: in_width,
                     height: in_height,
                 },
@@ -226,7 +128,7 @@ impl Task for PatchPyramidTask {
     }
 }
 
-struct BlitCopyImageTask {
+pub(super) struct BlitCopyImageTask {
     pub vimg_src: Id<Image>,
     pub vimg_dst: Id<Image>,
     pub src_array_layer: u32,
@@ -250,10 +152,7 @@ impl Task for BlitCopyImageTask {
         } else {
             [world.image_width, world.image_height, 1]
         };
-        trace!(
-            "Downsample in_level: {} to {}x{}",
-            self.src_array_layer, dst_offset[0], dst_offset[1]
-        );
+        trace!("BlitCopy in_level: {} to {}x{}", self.src_array_layer, dst_offset[0], dst_offset[1]);
         unsafe {
             cbf.blit_image(&BlitImageInfo {
                 src_image: self.vimg_src,

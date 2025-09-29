@@ -76,18 +76,19 @@ fn main() -> Result<(), ()> {
             max_image_height: img1.height().max(img2.height()),
             max_features: 3000,
             max_blobs: 8000,
+            // max_features: 10000,
+            // max_blobs: 30000,
             ..Default::default()
         },
         local_features::FeatureDetectParams::default(),
     )
     .unwrap();
 
-    let min_size = 0.0;
     let top_n = 2000;
-    info!("Limiting to best {top_n} features, minimum size {min_size}");
+    info!("Limiting to best {top_n} features");
     let start = std::time::Instant::now();
     let result1 = feats
-        .detect_top_n(&img1_f32.as_ndarray2(), top_n, min_size)
+        .detect_top_n(&img1_f32.as_ndarray2(), top_n, &Default::default())
         .unwrap();
     let time = start.elapsed();
 
@@ -100,12 +101,16 @@ fn main() -> Result<(), ()> {
             result1.dropped_features
         );
     } else {
-        info!("Extracted {} keypoints in {:?}", result1.keypoints.len(), time);
+        info!(
+            "Extracted {} keypoints in {:?}",
+            result1.keypoints.len(),
+            time
+        );
     }
 
     let start = std::time::Instant::now();
     let result2 = feats
-        .detect_top_n(&img2_f32.as_ndarray2(), top_n, min_size)
+        .detect_top_n(&img2_f32.as_ndarray2(), top_n, &Default::default())
         .unwrap();
     let time = start.elapsed();
 
@@ -118,7 +123,11 @@ fn main() -> Result<(), ()> {
             result2.dropped_features
         );
     } else {
-        info!("Extracted {} keypoints in {:?}", result2.keypoints.len(), time);
+        info!(
+            "Extracted {} keypoints in {:?}",
+            result2.keypoints.len(),
+            time
+        );
     }
 
     let FeaturesResult {

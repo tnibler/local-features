@@ -3,14 +3,14 @@ use std::sync::Arc;
 use log::trace;
 use vulkano::{
     buffer::Buffer,
-    pipeline::{ComputePipeline, Pipeline},
+    pipeline::{ComputePipeline, Pipeline, PipelineBindPoint},
 };
 use vulkano_taskgraph::{
     Id, Task, TaskContext, TaskResult,
     command_buffer::{BufferCopy, CopyBufferInfo, RecordingCommandBuffer},
 };
 
-use crate::{DESCRIPTOR_LEN, DIMS_INPUT};
+use crate::DESCRIPTOR_LEN;
 
 use super::{BufferIds, GlobalContext, shaders};
 
@@ -30,23 +30,18 @@ impl Task for KeypointOrientationTask {
         tcx: &mut TaskContext<'_>,
         world: &Self::World,
     ) -> TaskResult {
-        let extremum_locations = tcx
-            .buffer(self.vbuf_extremum_locations)?
-            .buffer()
-            .device_address()?
-            .get();
-        let filtered_extrema = tcx
-            .buffer(self.vbuf_filtered_extrema)?
-            .buffer()
-            .device_address()?
-            .get();
-        let keypoints = tcx
-            .buffer(self.vbuf_keypoint_indices)?
-            .buffer()
-            .device_address()?
-            .get();
+        let extremum_locations = tcx.buffer(self.vbuf_extremum_locations)?.buffer().device_address()?.get();
+        let filtered_extrema = tcx.buffer(self.vbuf_filtered_extrema)?.buffer().device_address()?.get();
+        let keypoints = tcx.buffer(self.vbuf_keypoint_indices)?.buffer().device_address()?.get();
 
         unsafe {
+            cbf.as_raw().bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                self.pipeline.layout(),
+                0,
+                &[world.physical_resources.descriptor_set.as_raw()],
+                &[],
+            )?;
             cbf.bind_pipeline_compute(&self.pipeline)?;
             cbf.push_constants(
                 self.pipeline.layout(),
@@ -55,14 +50,9 @@ impl Task for KeypointOrientationTask {
                     extremum_locations,
                     keypoints,
                     filtered_extrema,
-                    coarse_image_id: world.physical_resources.stor_coarse,
                     height: world.image_height,
                     width: world.image_width,
                     rt_max_keypoints: world.rt_max_keypoints,
-                    coarse_pyr_id: world.physical_resources.samp_coarse_pyr,
-                    // nearest or bilinear linear, is one better than the other?
-                    sampler_id: world.physical_resources.sampler_nearest,
-                    base_downsample: world.fixed_params.orientation_pyramid_base_downsample as i32,
                 },
             )?;
             let wg_count = [world.n_filtered_extrema, 1, 1];
@@ -87,11 +77,8 @@ impl Task for PatchBlurGradientTask {
         tcx: &mut vulkano_taskgraph::TaskContext<'_>,
         world: &Self::World,
     ) -> vulkano_taskgraph::TaskResult {
-        let patch_gradients_addr = tcx
-            .buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?
-            .buffer()
-            .device_address()?
-            .get();
+        let patch_gradients_addr =
+            tcx.buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?.buffer().device_address()?.get();
         unsafe {
             cbf.bind_pipeline_compute(&self.pipeline)?;
             cbf.push_constants(
@@ -101,18 +88,12 @@ impl Task for PatchBlurGradientTask {
                     image_width: world.image_width,
                     image_height: world.image_height,
                     patch_scale_factor: world.patch_scale_factor,
-                    pyramid_texture_id: world.physical_resources.samp_patch_pyr,
-                    pyramid_sampler_id: world.physical_resources.sampler,
                     extremum_locations: tcx
                         .buffer(self.buffers.buf_extremum_locations)?
                         .buffer()
                         .device_address()?
                         .into(),
-                    keypoints: tcx
-                        .buffer(self.buffers.buf_keypoints)?
-                        .buffer()
-                        .device_address()?
-                        .into(),
+                    keypoints: tcx.buffer(self.buffers.buf_keypoints)?.buffer().device_address()?.into(),
                     patch_gradients: patch_gradients_addr,
                 },
             )?;
@@ -123,12 +104,13 @@ impl Task for PatchBlurGradientTask {
         Ok(())
     }
 }
-pub(super) struct EmbeddingTask {
+
+pub(super) struct EmbeddingCartesianTask {
     pub buffers: BufferIds,
     pub pipeline: Arc<ComputePipeline>,
 }
 
-impl Task for EmbeddingTask {
+impl Task for EmbeddingCartesianTask {
     type World = GlobalContext;
 
     unsafe fn execute(
@@ -137,26 +119,11 @@ impl Task for EmbeddingTask {
         tcx: &mut TaskContext<'_>,
         world: &Self::World,
     ) -> TaskResult {
-        let keypoints_addr = tcx
-            .buffer(self.buffers.buf_keypoints)?
-            .buffer()
-            .device_address()?
-            .get();
-        let patch_gradients_addr = tcx
-            .buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?
-            .buffer()
-            .device_address()?
-            .get();
-        let embeddings_addr = tcx
-            .buffer(self.buffers.buf_embeddings_or_descriptors)?
-            .buffer()
-            .device_address()?
-            .get();
-        let consts_addr = tcx
-            .buffer(self.buffers.buf_constants)?
-            .buffer()
-            .device_address()?
-            .get();
+        let keypoints_addr = tcx.buffer(self.buffers.buf_keypoints)?.buffer().device_address()?.get();
+        let patch_gradients_addr =
+            tcx.buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?.buffer().device_address()?.get();
+        let embeddings_addr = tcx.buffer(self.buffers.buf_embeddings_or_descriptors)?.buffer().device_address()?.get();
+        let consts_addr = tcx.buffer(self.buffers.buf_constants)?.buffer().device_address()?.get();
 
         unsafe {
             cbf.bind_pipeline_compute(&self.pipeline)?;
@@ -171,7 +138,49 @@ impl Task for EmbeddingTask {
                 },
             )?;
         }
-        let wg_count = [world.rt_max_keypoints, DIMS_INPUT as u32, 1];
+        let wg_count = [world.rt_max_keypoints, 2, 1];
+        trace!("Dispatch embedding: {wg_count:?}");
+        unsafe {
+            cbf.dispatch(wg_count)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct EmbeddingTask {
+    pub buffers: BufferIds,
+    pub pipeline: Arc<ComputePipeline>,
+}
+
+impl Task for EmbeddingTask {
+    type World = GlobalContext;
+
+    unsafe fn execute(
+        &self,
+        cbf: &mut RecordingCommandBuffer<'_>,
+        tcx: &mut TaskContext<'_>,
+        world: &Self::World,
+    ) -> TaskResult {
+        let keypoints_addr = tcx.buffer(self.buffers.buf_keypoints)?.buffer().device_address()?.get();
+        let patch_gradients_addr =
+            tcx.buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?.buffer().device_address()?.get();
+        let embeddings_addr = tcx.buffer(self.buffers.buf_embeddings_or_descriptors)?.buffer().device_address()?.get();
+        let consts_addr = tcx.buffer(self.buffers.buf_constants)?.buffer().device_address()?.get();
+
+        unsafe {
+            cbf.bind_pipeline_compute(&self.pipeline)?;
+            cbf.push_constants(
+                self.pipeline.layout(),
+                0,
+                &shaders::shaders_f32::EmbedPc {
+                    keypoints: keypoints_addr,
+                    patch_gradients: patch_gradients_addr,
+                    consts: consts_addr,
+                    embeddings: embeddings_addr,
+                },
+            )?;
+        }
+        let wg_count = [world.rt_max_keypoints, 1, 1];
         trace!("Dispatch embedding: {wg_count:?}");
         unsafe {
             cbf.dispatch(wg_count)?;
@@ -193,21 +202,10 @@ impl Task for FirstNormalizeTask {
         tcx: &mut TaskContext<'_>,
         world: &Self::World,
     ) -> TaskResult {
-        let keypoints_addr = tcx
-            .buffer(self.buffers.buf_keypoints)?
-            .buffer()
-            .device_address()?
-            .get();
-        let embeddings_addr = tcx
-            .buffer(self.buffers.buf_embeddings_or_descriptors)?
-            .buffer()
-            .device_address()?
-            .get();
-        let raw_descriptors_addr = tcx
-            .buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?
-            .buffer()
-            .device_address()?
-            .get();
+        let keypoints_addr = tcx.buffer(self.buffers.buf_keypoints)?.buffer().device_address()?.get();
+        let embeddings_addr = tcx.buffer(self.buffers.buf_embeddings_or_descriptors)?.buffer().device_address()?.get();
+        let raw_descriptors_addr =
+            tcx.buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?.buffer().device_address()?.get();
 
         unsafe {
             cbf.bind_pipeline_compute(&self.pipeline)?;
@@ -244,29 +242,11 @@ impl Task for WhiteningTask {
         tcx: &mut TaskContext<'_>,
         world: &Self::World,
     ) -> TaskResult {
-        let rows_per_wg = 32;
-        let rows_out = 128;
-
-        let keypoints_addr = tcx
-            .buffer(self.buffers.buf_keypoints)?
-            .buffer()
-            .device_address()?
-            .get();
-        let raw_descriptors_addr = tcx
-            .buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?
-            .buffer()
-            .device_address()?
-            .get();
-        let descriptors_addr = tcx
-            .buffer(self.buffers.buf_embeddings_or_descriptors)?
-            .buffer()
-            .device_address()?
-            .get();
-        let consts_addr = tcx
-            .buffer(self.buffers.buf_constants)?
-            .buffer()
-            .device_address()?
-            .get();
+        let keypoints_addr = tcx.buffer(self.buffers.buf_keypoints)?.buffer().device_address()?.get();
+        let raw_descriptors_addr =
+            tcx.buffer(self.buffers.buf_patch_gradients_or_raw_descriptors)?.buffer().device_address()?.get();
+        let descriptors_addr = tcx.buffer(self.buffers.buf_embeddings_or_descriptors)?.buffer().device_address()?.get();
+        let consts_addr = tcx.buffer(self.buffers.buf_constants)?.buffer().device_address()?.get();
 
         unsafe {
             cbf.bind_pipeline_compute(&self.pipeline)?;
@@ -281,7 +261,7 @@ impl Task for WhiteningTask {
                 },
             )?;
         }
-        let wg_count = [world.rt_max_keypoints, rows_out / rows_per_wg, 1];
+        let wg_count = [128 / 8, world.rt_max_keypoints.div_ceil(8), 1];
         unsafe {
             trace!("Dispatch whitening: {wg_count:?}");
             cbf.dispatch(wg_count)?;
@@ -304,27 +284,16 @@ impl Task for FinalNormalizeTask {
         tcx: &mut TaskContext<'_>,
         world: &Self::World,
     ) -> TaskResult {
-        let keypoints_addr = tcx
-            .buffer(self.buffers.buf_keypoints)?
-            .buffer()
-            .device_address()?
-            .get();
+        let keypoints_addr = tcx.buffer(self.buffers.buf_keypoints)?.buffer().device_address()?.get();
 
-        let descriptors_addr = tcx
-            .buffer(self.buffers.buf_embeddings_or_descriptors)?
-            .buffer()
-            .device_address()?
-            .get();
+        let descriptors_addr = tcx.buffer(self.buffers.buf_embeddings_or_descriptors)?.buffer().device_address()?.get();
 
         unsafe {
             cbf.bind_pipeline_compute(&self.pipeline)?;
             cbf.push_constants(
                 self.pipeline.layout(),
                 0,
-                &shaders::shaders_f32::L2NormalizePc {
-                    keypoints: keypoints_addr,
-                    descriptors: descriptors_addr,
-                },
+                &shaders::shaders_f32::L2NormalizePc { keypoints: keypoints_addr, descriptors: descriptors_addr },
             )?;
         }
         let wg_count = [world.rt_max_keypoints, 1, 1];
@@ -350,17 +319,13 @@ impl Task for DescriptorAndKeypointCopyTask {
         world: &Self::World,
     ) -> TaskResult {
         let keypoints_copy_size = world.buffer_layouts.keypoints.size_total;
-        let descriptor_copy_size =
-            u64::from(world.rt_max_keypoints) * DESCRIPTOR_LEN as u64 * size_of::<f32>() as u64;
+        let descriptor_copy_size = u64::from(world.rt_max_keypoints) * DESCRIPTOR_LEN as u64 * size_of::<f32>() as u64;
         trace!("Copy keypoints and descriptors to staging");
         unsafe {
             cbf.copy_buffer(&CopyBufferInfo {
                 src_buffer: self.buffers.buf_keypoints,
                 dst_buffer: self.buffers.buf_staging,
-                regions: &[BufferCopy {
-                    size: keypoints_copy_size,
-                    ..Default::default()
-                }],
+                regions: &[BufferCopy { size: keypoints_copy_size, ..Default::default() }],
                 ..Default::default()
             })?;
             cbf.copy_buffer(&CopyBufferInfo {

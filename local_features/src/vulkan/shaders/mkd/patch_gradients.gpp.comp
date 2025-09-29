@@ -1,7 +1,9 @@
+$include["../macros.gpp"]
+// TRIM_ABOVE
 #version 460
 #include "../extensions.glsl"
-#include "../common.glsl"
-#include "../atan2.glsl"
+#include "../common.gpp.glsl"
+#include "swizzle.gpp.glsl"
 
 layout(local_size_x = 32, local_size_y = 32) in;
 
@@ -9,8 +11,6 @@ layout(push_constant) uniform PatchGradientsPc {
     ExtremumLocations extremum_locations;
     KeypointIndices keypoints;
     PatchBuffer patch_gradients;
-    SampledImageId pyramid_texture_id;
-    SamplerId pyramid_sampler_id;
     uint image_width;
     uint image_height;
     float patch_scale_factor;
@@ -40,32 +40,38 @@ void main() {
     const uint local_y = gl_LocalInvocationID.y;
 
     const uint kp_loc_idx = keypoints.data[patch_index];
-    const float scale = get_extremum_scale_float(extremum_locations, kp_loc_idx) * patch_scale_factor / float(PATCH_SIZE);
-    // const float scale = 1;
-
-    const float log2_scale = log2(scale);
-    // index of image in pyramid
-    const float kp_scale_level = floor(log2_scale);
-    // scale factor within correct pyramid image
-    const float rem_scale = pow(2, log2_scale - kp_scale_level);
+    const float scale = get_extremum_scale_float(extremum_locations, kp_loc_idx) * patch_scale_factor;
+    const float kp_scale_level = floor(log2(scale));
 
     const float patch_x = get_extremum_x_float(extremum_locations, kp_loc_idx);
     const float patch_y = get_extremum_y_float(extremum_locations, kp_loc_idx);
     const float patch_angle = radians(uintBitsToFloat(keypoints.data[MAX_KEYPOINTS + patch_index]));
 
     {
-        const ivec2 img_size = textureSize(vko_texture2D(pyramid_texture_id), int(kp_scale_level));
-
+        const vec2 texture_size = textureSize(@texture_patch_pyr, 0);
         const float ps2 = float(PATCH_SIZE) / 2.0;
         const float xx = (float(local_x) - ps2) * cos(patch_angle) - (float(local_y) - ps2) * sin(patch_angle);
         const float yy = (float(local_x) - ps2) * sin(patch_angle) + (float(local_y) - ps2) * cos(patch_angle);
-        const float sample_x = xx * rem_scale + patch_x / pow(2., kp_scale_level);
-        const float sample_y = yy * rem_scale + patch_y / pow(2., kp_scale_level);
-        sh_patch[local_y * PATCH_SIZE + local_x] = textureLod(
-            vko_sampler2D(pyramid_texture_id, pyramid_sampler_id),
-            vec2((sample_x + 0.5) / float(img_size.x), (sample_y + 0.5) / float(img_size.y)),
-            kp_scale_level
-        ).r;
+        const float sample_x = xx + patch_x;
+        const float sample_y = yy + patch_y;
+        if (kp_scale_level == 0) {
+            sh_patch[local_y * PATCH_SIZE + local_x] = texture(
+                sampler2DArray(texture_coarse, @sampler_bil),
+                vec3((sample_x + 0.5) / texture_size.x, (sample_y + 0.5) / texture_size.y, 0)
+            ).r;
+        } else {
+            sh_patch[local_y * PATCH_SIZE + local_x] = textureLod(
+                sampler2D(@texture_patch_pyr, @sampler_bil),
+                vec2(sample_x + 0.5, sample_y + 0.5)/ texture_size,
+                // No real justification for the -1 here. Seems to work quite well,
+                // but no comprehensive testing. 
+                // More aliasing (-1 means subsampling 2x higher res layer) can lead to better matching
+                // on easy/very similar images since it kind of sharpens/reinforces patterns
+                // in almost identical ways in both images. But could definitely be different
+                // in the general case.
+                kp_scale_level - 1
+            ).r;
+        }
         barrier();
     }
 
@@ -98,8 +104,10 @@ void main() {
     const float EPS = 1e-8;
     // sqrt pulled out from embed_gradients
     const float mag = sqrt(sqrt(grad_x * grad_x + grad_y * grad_y + EPS));
-    const float angle = -atan2(grad_x, grad_y);
+    const float angle = -atan(grad_y, grad_x);
 
-    patch_gradients.patches[patch_index].data[local_y * PATCH_SIZE + local_x] = mag;
-    patch_gradients.patches[MAX_KEYPOINTS + patch_index].data[local_y * PATCH_SIZE + local_x] = angle;
+    const uint out_index = swizzled_index(local_x, local_y);
+    @ASSERT(unswizzle_index(out_index) == uvec2(local_x, local_y));
+    patch_gradients.patches[patch_index].data[out_index] = mag;
+    patch_gradients.patches[MAX_KEYPOINTS + patch_index].data[out_index] = angle;
 }

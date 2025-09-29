@@ -34,7 +34,7 @@ fn vulkansift(c: &mut Criterion) {
         max_image_width: width,
         max_image_height: height,
         do_upscale: true,
-        max_features: 8000,
+        max_features: 10000,
     };
     let mut vk_sift = unsafe { VulkanSift::new(config).expect("Error creating VulkanSift") };
 
@@ -46,13 +46,14 @@ fn vulkansift(c: &mut Criterion) {
 
 fn local_features(c: &mut Criterion) {
     let mut group = c.benchmark_group("local_features");
-    group.sample_size(50);
+    group.sample_size(20);
     group.measurement_time(Duration::from_millis(6000));
     let scale = 1.0;
     let image = open_image(PATH, scale);
     let image: image::ImageBuffer<image::Luma<f32>, Vec<f32>> = image.convert();
     let image: Array2<f32> = image.into_ndarray2();
-    let max_features = 8000;
+    let max_features = 10000;
+    let max_blobs = 20000;
 
     let vk = local_features::vulkan::Vulkan::new().expect("need vulkan");
     let mut lf = local_features::new_vulkan(
@@ -62,14 +63,17 @@ fn local_features(c: &mut Criterion) {
             max_image_width: image.ncols() as u32,
             max_image_height: image.nrows() as u32,
             max_features: max_features as u32,
-            max_blobs: 3 * max_features as u32,
+            max_blobs: max_blobs as u32,
             ..Default::default()
         },
         local_features::FeatureDetectParams::default(),
     )
     .unwrap();
     group.bench_function("local_features", |b| {
-        b.iter(|| lf.detect_extract_all(&image.view()).unwrap())
+        b.iter(|| {
+            lf.detect_extract_all(&image.view(), &Default::default())
+                .unwrap()
+        })
     });
     group.finish();
 }

@@ -2,3 +2,4 @@
 .direnv
 .envrc
 result
+local-features/src/vulkan/shaders_build

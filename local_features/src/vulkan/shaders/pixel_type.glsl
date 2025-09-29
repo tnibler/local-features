@@ -13,6 +13,7 @@
     #define IMG_FORMAT r32f
     #define PX_TYPE float
     #define vko_image2DArray_FORMAT vko_image2DArray_r32f
+    #define vko_image2D_FORMAT vko_image2D_r32f
     #define vec4_FORMAT vec4
 #endif
 #ifdef PRECISION_FLOAT16
@@ -22,13 +23,10 @@
     #define IMG_FORMAT r16f
     #define PX_TYPE float16_t
     #define vko_image2DArray_FORMAT vko_image2DArray_r16f
+    #define vko_image2D_FORMAT vko_image2D_r16f
     #define vec4_FORMAT f16vec4
 
     precision mediump float;
 #endif 
-
-layout(buffer_reference, std430, buffer_reference_align=8) buffer PixelBuffer {
-    PX_TYPE[] data;
-};
 
 #endif // _PIXEL_TYPE_GLSL

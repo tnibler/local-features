@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use log::debug;
+use log::trace;
 use vulkano::{
     buffer::Buffer,
-    image::{Image, ImageAspects, ImageSubresourceLayers},
-    pipeline::{ComputePipeline, Pipeline},
+    image::{Image, ImageAspects},
+    pipeline::{ComputePipeline, Pipeline, PipelineBindPoint},
 };
 use vulkano_taskgraph::{
     Id, Task, TaskContext, TaskResult,
-    command_buffer::{BlitImageInfo, BufferImageCopy, ImageBlit, RecordingCommandBuffer},
+    command_buffer::{BufferImageCopy, RecordingCommandBuffer},
     resource::ImageLayoutType,
 };
 
@@ -33,16 +33,8 @@ impl Task for UploadImageTask {
             // Worlds become arrays indexed by tcx.current_frame_index, and each pointer must be
             // valid for the duration of its corresponding flight
 
-            tcx.write_buffer::<[f32]>(
-                self.dst_buffer,
-                ..(world.input_image.len() * size_of::<f32>()) as u64,
-            )?
-            .copy_from_slice(
-                world
-                    .input_image
-                    .as_ref()
-                    .expect("input image must be valid pointer"),
-            );
+            tcx.write_buffer::<[f32]>(self.dst_buffer, ..(world.input_image.len() * size_of::<f32>()) as u64)?
+                .copy_from_slice(world.input_image.as_ref().expect("input image must be valid pointer"));
         }
         Ok(())
     }
@@ -115,6 +107,7 @@ pub(super) struct BlurTask {
     pub direction: BlurDirection,
     pub do_bind_pipeline: bool,
     pub pipeline: Arc<ComputePipeline>,
+    pub in_out_level: u32,
 }
 
 impl Task for BlurTask {
@@ -127,13 +120,18 @@ impl Task for BlurTask {
         world: &Self::World,
     ) -> TaskResult {
         unsafe {
+            cbf.as_raw().bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                self.pipeline.layout(),
+                0,
+                &[world.physical_resources.descriptor_set.as_raw()],
+                &[],
+            )?;
             cbf.push_constants(
                 self.pipeline.layout(),
                 0,
-                &shaders::shaders_f32::BlurPc {
-                    coarse_texture_id: world.physical_resources.samp_coarse,
-                    coarse_image_id: world.physical_resources.stor_coarse,
-                    coarse_sampler_id: world.physical_resources.sampler,
+                &shaders::shaders_f32::ConvPc {
+                    in_level: self.in_out_level,
                     width: world.image_width,
                     height: world.image_height,
                     vertical_pass: match self.direction {
@@ -150,13 +148,13 @@ impl Task for BlurTask {
         }
         let width = world.image_width;
         let height = world.image_height;
-        let wg_count = {
-            let wg_size_x = 8;
-            let wg_size_y = 8;
-            let wg_per_col = height.div_ceil(wg_size_y);
-            let wg_per_row = width.div_ceil(wg_size_x);
-            [wg_per_row, wg_per_col, 1]
+        let wg_size_x = 64;
+        let wg_size_y = 2;
+        let wg_count = match self.direction {
+            BlurDirection::Horizontal => [width.div_ceil(wg_size_x), height.div_ceil(wg_size_y), 1],
+            BlurDirection::Vertical => [height.div_ceil(wg_size_x), width.div_ceil(wg_size_y), 1],
         };
+        trace!("Dense blur: {:?}, in/out_level={}, dispatch={:?}", self.direction, self.in_out_level, wg_count);
         unsafe {
             cbf.dispatch(wg_count)?;
         }
@@ -165,12 +163,12 @@ impl Task for BlurTask {
 }
 
 pub(super) struct SWTTask {
-    /// Number of scale space layers plus the extra scratch image
-    pub n_coarse_levels_plus_one: u32,
     pub input_level: u32,
     pub direction: BlurDirection,
     pub do_bind_pipeline: bool,
     pub pipeline: Arc<ComputePipeline>,
+    pub pipeline_sparse1: Arc<ComputePipeline>,
+    pub pipeline_sparse2: Arc<ComputePipeline>,
 }
 
 impl Task for SWTTask {
@@ -183,23 +181,27 @@ impl Task for SWTTask {
         world: &Self::World,
     ) -> vulkano_taskgraph::TaskResult {
         unsafe {
-            if self.do_bind_pipeline {
-                cbf.bind_pipeline_compute(&self.pipeline)?;
+            match self.input_level {
+                0 => {
+                    panic!("wrong pipeline, Blur is the one");
+                }
+                1 => {
+                    cbf.bind_pipeline_compute(&self.pipeline_sparse1)?;
+                }
+                2.. => {
+                    cbf.bind_pipeline_compute(&self.pipeline_sparse2)?;
+                }
             }
 
             cbf.push_constants(
                 self.pipeline.layout(),
                 0,
-                &shaders::shaders_f32::SwtPc {
+                &shaders::shaders_f32::ConvPc {
                     vertical_pass: match self.direction {
                         BlurDirection::Horizontal => 0,
                         BlurDirection::Vertical => 1,
                     },
                     in_level: self.input_level,
-                    n_coarse_levels: self.n_coarse_levels_plus_one,
-                    coarse_texture_id: world.physical_resources.samp_coarse,
-                    coarse_image_id: world.physical_resources.stor_coarse,
-                    coarse_sampler_id: world.physical_resources.sampler,
                     width: world.image_width,
                     height: world.image_height,
                 },
@@ -207,54 +209,24 @@ impl Task for SWTTask {
         }
         let width = world.image_width;
         let height = world.image_height;
-        let wg_count = {
-            let wg_size_x = 8;
-            let wg_size_y = 8;
-            let wg_per_row = width.div_ceil(wg_size_x);
-            let wg_per_col = height.div_ceil(wg_size_y);
-            [wg_per_row, wg_per_col, 1]
+        let wg_count = match self.input_level {
+            0 => panic!("wrong"),
+            1 => {
+                let wg_cover_x = 64;
+                let wg_cover_y = 2;
+                match self.direction {
+                    BlurDirection::Horizontal => [width.div_ceil(wg_cover_x), height.div_ceil(wg_cover_y), 1],
+                    BlurDirection::Vertical => [height.div_ceil(wg_cover_x), width.div_ceil(wg_cover_y), 1],
+                }
+            }
+            2.. => {
+                let (wg_cover_x, wg_cover_y) = (32, 8);
+                let wg_per_row = width.div_ceil(wg_cover_x);
+                let wg_per_col = height.div_ceil(wg_cover_y);
+                [wg_per_row, wg_per_col, 1]
+            }
         };
-        unsafe {
-            cbf.dispatch(wg_count)?;
-        }
-        Ok(())
-    }
-}
-
-pub(super) struct SWTSubTask {
-    pub vbuf_fine: Id<Buffer>,
-    pub n_fine_scales: u32,
-    pub pipeline: Arc<ComputePipeline>,
-}
-
-impl Task for SWTSubTask {
-    type World = GlobalContext;
-    unsafe fn execute(
-        &self,
-        cbf: &mut RecordingCommandBuffer<'_>,
-        tcx: &mut TaskContext<'_>,
-        world: &Self::World,
-    ) -> TaskResult {
-        let buf_fine = tcx.buffer(self.vbuf_fine)?.buffer();
-        unsafe {
-            cbf.bind_pipeline_compute(&self.pipeline)?;
-            cbf.push_constants(
-                self.pipeline.layout(),
-                0,
-                &shaders::shaders_f32::SwtSubPc {
-                    fine: buf_fine.device_address()?.into(),
-                    coarse_texture_id: world.physical_resources.samp_coarse,
-                    coarse_sampler_id: world.physical_resources.sampler,
-                    width: world.image_width,
-                    height: world.image_height,
-                },
-            )?;
-        }
-        let wg_count = {
-            let wg_size_x = 32;
-            let wg_per_row = world.image_width.div_ceil(wg_size_x);
-            [wg_per_row, world.image_height, self.n_fine_scales]
-        };
+        trace!("SWT blur: {:?}, in_level={}, dispatch {:?}", self.direction, self.input_level, wg_count);
         unsafe {
             cbf.dispatch(wg_count)?;
         }
@@ -264,7 +236,6 @@ impl Task for SWTSubTask {
 
 pub(super) struct ScanExtremaTask {
     pub n_fine_scales: u32,
-    pub vbuf_fine: Id<Buffer>,
     pub vbuf_extremum_locations: Id<Buffer>,
     pub pipeline: Arc<ComputePipeline>,
 }
@@ -277,97 +248,43 @@ impl Task for ScanExtremaTask {
         tcx: &mut TaskContext<'_>,
         world: &Self::World,
     ) -> TaskResult {
-        let addr = |id: Id<Buffer>| {
-            Ok::<_, vulkano_taskgraph::TaskError>(tcx.buffer(id)?.buffer().device_address()?)
-        };
+        let addr = |id: Id<Buffer>| Ok::<_, vulkano_taskgraph::TaskError>(tcx.buffer(id)?.buffer().device_address()?);
         unsafe {
             cbf.bind_pipeline_compute(&self.pipeline)?;
             cbf.push_constants(
                 self.pipeline.layout(),
                 0,
                 &shaders::shaders_f32::ScanExtremaPc {
-                    fine: addr(self.vbuf_fine)?.into(),
                     extremum_locations: addr(self.vbuf_extremum_locations)?.into(),
                     width: world.image_width,
                     height: world.image_height,
                     n_fine_levels: self.n_fine_scales,
                     border: world.border,
                     contrast_threshold: world.contrast_threshold,
+                    min_scale: world.extremum_min_scale,
+                    edgeness_cm_low: world.edgeness_cm_low,
+                    edgeness_cm_high: world.edgeness_cm_high,
+                    // TODO: unused. If min_scale implies that all extrema below a certain layer
+                    // get filtered, no need to even process it.
                     skip_layers: world.extremum_skip_layers,
                     max_extrema: world.rt_max_extrema,
                 },
             )?;
         }
         let wg_count = {
-            let wg_size_x = 4;
-            let wg_size_y = 4;
-            let wg_size_z = 4;
+            let wg_cover_x = (6 + 1) * 2;
+            let wg_cover_y = (6 + 1) * 2;
+            let wg_cover_z = 7;
             // scan from start_layer to n_fine_scale - 1 (inclusive),
             [
-                (world.image_width - 2 * world.border).div_ceil(wg_size_x),
-                (world.image_height - 2 * world.border).div_ceil(wg_size_y),
-                (self.n_fine_scales - 2 - world.extremum_skip_layers).div_ceil(wg_size_z),
+                (world.image_width - 2 * world.border).div_ceil(wg_cover_x),
+                (world.image_height - 2 * world.border).div_ceil(wg_cover_y),
+                (self.n_fine_scales - world.extremum_skip_layers).div_ceil(wg_cover_z),
             ]
         };
+        trace!("DoG Extrema: dispatch {:?}", wg_count);
         unsafe {
             cbf.dispatch(wg_count)?;
-        }
-        Ok(())
-    }
-}
-
-pub(super) struct BlitPyramidImageTask {
-    pub vimg_src: Id<Image>,
-    pub vimg_dst: Id<Image>,
-    pub src_array_layer: u32,
-    pub dst_mip_level: u32,
-    pub scale_factor: f32,
-}
-
-impl Task for BlitPyramidImageTask {
-    type World = GlobalContext;
-    unsafe fn execute(
-        &self,
-        cbf: &mut vulkano_taskgraph::command_buffer::RecordingCommandBuffer<'_>,
-        _tcx: &mut vulkano_taskgraph::TaskContext<'_>,
-        world: &Self::World,
-    ) -> vulkano_taskgraph::TaskResult {
-        if self.src_array_layer >= world.rt_ori_pyr_levels {
-            return Ok(());
-        }
-        let dst_offset = [
-            (world.image_width as f32 * self.scale_factor).round() as u32,
-            (world.image_height as f32 * self.scale_factor).round() as u32,
-            1,
-        ];
-        debug!(
-            "Coarse level {} to level {} {}x{}",
-            self.src_array_layer, self.dst_mip_level, dst_offset[0], dst_offset[1]
-        );
-        unsafe {
-            cbf.blit_image(&BlitImageInfo {
-                src_image: self.vimg_src,
-                dst_image: self.vimg_dst,
-                src_image_layout: ImageLayoutType::General,
-                dst_image_layout: ImageLayoutType::General,
-                filter: vulkano::image::sampler::Filter::Nearest,
-                regions: &[ImageBlit {
-                    src_subresource: ImageSubresourceLayers {
-                        aspects: ImageAspects::COLOR,
-                        base_array_layer: self.src_array_layer,
-                        ..Default::default()
-                    },
-                    src_offsets: [[0, 0, 0], [world.image_width, world.image_height, 1]],
-                    dst_subresource: ImageSubresourceLayers {
-                        aspects: ImageAspects::COLOR,
-                        mip_level: self.dst_mip_level,
-                        ..Default::default()
-                    },
-                    dst_offsets: [[0, 0, 0], dst_offset],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })?;
         }
         Ok(())
     }

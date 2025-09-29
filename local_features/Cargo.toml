@@ -3,6 +3,9 @@ name = "local_features"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+bench = false
+
 [dependencies]
 itertools = { workspace = true } 
 ndarray = { workspace = true } 
@@ -10,22 +13,18 @@ ndarray = { workspace = true }
 thiserror = "2.0.11"
 safetensors = { version = "0.5.2" }
 byte-slice-cast = "1.2.2"
-vulkano = { git = "https://github.com/vulkano-rs/vulkano", rev = "37c36b5af107f08a6173cce12146c54a75dd56b4", default-features = false, features = ["macros"] }
-vulkano-taskgraph = { git = "https://github.com/vulkano-rs/vulkano", rev = "37c36b5af107f08a6173cce12146c54a75dd56b4" }
-vulkano-shaders = { git = "https://github.com/vulkano-rs/vulkano", rev = "37c36b5af107f08a6173cce12146c54a75dd56b4", features = ["shaderc-debug"] }
+vulkano = { git = "https://github.com/vulkano-rs/vulkano", rev = "36c85057884f1684ed671976228046f415710d98", default-features = false, features = ["macros"] }
+vulkano-taskgraph = { git = "https://github.com/vulkano-rs/vulkano", rev = "36c85057884f1684ed671976228046f415710d98" }
+vulkano-shaders = { git = "https://github.com/vulkano-rs/vulkano", rev = "36c85057884f1684ed671976228046f415710d98", features = ["shaderc-debug"] }
 bytemuck = { version = "1.9" }
 order-stat = "0.1.3"
 float-ord = "0.3.2"
 index_vec = "0.1.4"
 fxhash = "0.2.1"
 log = { workspace = true }
+renderdoc = "0.12.1"
 
 [dev-dependencies]
-criterion = { workspace = true }
 image = { workspace = true }
 imageproc = { workspace = true }
 nshare = { workspace = true }
-
-[[bench]]
-name = "bench"
-harness = false

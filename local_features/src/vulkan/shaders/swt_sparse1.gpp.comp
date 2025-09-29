@@ -1,0 +1,135 @@
+$include["macros.gpp"]
+// TRIM_ABOVE
+#version 460
+#include "extensions.glsl"
+#include "pixel_type.glsl"
+#include "common.gpp.glsl"
+#include "conv_pushconstants.glsl"
+
+// Separable convolution with kernel of size 5, dilated with 1 zero between each element.
+// WG_SIZE_X must be at least 1 subgroup, currently it would be wrong if a subgroup spanned more than one processed row.
+
+const int QUAD_ROWS = 1;
+const int WG_SIZE_X = 64;
+const int WG_SIZE_Y = QUAD_ROWS;
+layout(local_size_x = WG_SIZE_X, local_size_y = WG_SIZE_Y) in;
+
+
+const int N_QUADS = WG_SIZE_X / 2; // write this many result quads
+const int HALO_QUADS = 2;
+
+const int QUAD_ROW_WIDTH = N_QUADS + 2 * HALO_QUADS;
+
+// 2 Rows if horizontal pass, 2 columns if vertial
+shared float sh_samples[2 * QUAD_ROWS][2 * QUAD_ROW_WIDTH];
+
+const float KERNEL[] = { 1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.0 };
+
+void main() {
+    const vec2 texture_size = textureSize(@texture_scratch, 0);
+
+    const int wg_long = int(gl_WorkGroupID.x) * WG_SIZE_X;
+    const int wg_short = int(gl_WorkGroupID.y) * WG_SIZE_Y * 2;
+
+    const int local_x = int(gl_LocalInvocationID.x);
+    // const uint local_y = gl_LocalInvocationID.y;
+
+    if (vertical_pass) {
+        if (wg_short >= width || wg_long >= height) {
+            return;
+        }
+
+        for (int quad_row = 0; quad_row < QUAD_ROWS; quad_row++) {
+            for (int load_quad = int(gl_LocalInvocationIndex); load_quad < N_QUADS + 2 * HALO_QUADS; load_quad += WG_SIZE_X * WG_SIZE_Y) {
+                const int load_loc = 2 * (load_quad - HALO_QUADS);
+                vec2 coords = vec2(
+                    float(wg_short + 2 * quad_row + 1) / texture_size.x, 
+                    float(wg_long + 1 + load_loc) / texture_size.y
+                );
+                // bl br tr tl
+                const vec4 samp = textureGather(sampler2D(@texture_scratch, @sampler_bil), coords);
+
+                // left column
+                sh_samples[2 * quad_row][2 * load_quad] = samp.w;
+                sh_samples[2 * quad_row][2 * load_quad + 1] = samp.x;
+                // right column
+                sh_samples[2 * quad_row + 1][2 * load_quad] = samp.z;
+                sh_samples[2 * quad_row + 1][2 * load_quad + 1] = samp.y;
+            }
+        }
+    } else {
+        if (wg_long >= width || wg_short >= height) {
+            return;
+        }
+        for (int quad_row = 0; quad_row < QUAD_ROWS; quad_row++) {
+            for (int load_quad = int(gl_LocalInvocationIndex); load_quad < N_QUADS + 2 * HALO_QUADS; load_quad += WG_SIZE_X * WG_SIZE_Y) {
+                const int load_loc = 2 * (load_quad - HALO_QUADS);
+                vec3 coords = vec3(
+                    float(wg_long + 1 + load_loc) / texture_size.x, 
+                    float(wg_short + 2 * quad_row + 1) / texture_size.y,
+                    in_level
+                );
+                const vec4 samp = textureGather(sampler2DArray(texture_coarse, @sampler_bil), coords);
+
+                // top row
+                sh_samples[2 * quad_row][2 * load_quad] = samp.w;
+                sh_samples[2 * quad_row][2 * load_quad + 1] = samp.z;
+                // bottom row
+                sh_samples[2 * quad_row + 1][2 * load_quad] = samp.x;
+                sh_samples[2 * quad_row + 1][2 * load_quad + 1] = samp.y;
+            }
+        }
+    }
+    barrier();
+
+    for (int local_y = 0; local_y < 2; local_y++) {
+        const ivec3 write_loc = vertical_pass ? 
+            ivec3(wg_short + local_y, wg_long + local_x, in_level + 1) : ivec3(wg_long + local_x, wg_short + local_y, 0);
+        const bool in_write_bounds = vertical_pass ? 
+            (wg_long + local_x < height && wg_short + local_y < width) 
+            : (wg_long + local_x < width && wg_short + local_y < height);
+
+        const float center_sample = sh_samples[local_y][local_x + 2];
+
+        if (gl_SubgroupSize <= 8) {
+            // TODO: 
+        } else {
+            const float my_sample = sh_samples[local_y][local_x];
+            float my_result = my_sample * KERNEL[0];
+
+            const float p[4] = {
+                subgroupShuffleDown(my_sample, 2),
+                subgroupShuffleDown(my_sample, 4),
+                subgroupShuffleDown(my_sample, 6),
+                subgroupShuffleDown(my_sample, 8),
+            };
+            [[unroll]]
+            for (int i = 0; i < 4; i++) {
+                if (gl_SubgroupInvocationID < gl_SubgroupSize - 2 * (i + 1)) {
+                    my_result += p[i] * KERNEL[i+1];
+                }
+            }
+
+            // highest subgroup invocations shifted in garbage earlier, so get their halo elements now
+            if (gl_SubgroupInvocationID >= gl_SubgroupSize - 8) {
+                int els_missing = (8 + int(gl_SubgroupInvocationID) - (int(gl_SubgroupSize) - 1) + 1) / 2;
+                float right_tail = sh_samples[local_y][gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID + 8];
+                [[unroll]]
+                for (int i = 0; i < 4; i++) {
+                    if (gl_SubgroupInvocationID > gl_SubgroupSize - 1 - 8 + 2 * i) {
+                        my_result += right_tail * KERNEL[4 - i];
+                    }
+                    right_tail = subgroupShuffleUp(right_tail, 2);
+                }
+            }
+
+            if (in_write_bounds) {
+                if (vertical_pass) {
+                    imageStore(image_coarse, write_loc, vec4_FORMAT(my_result, 0.0, 0.0, 1.0));
+                } else {
+                    imageStore(@image_scratch, write_loc.xy, vec4_FORMAT(my_result, 0.0, 0.0, 1.0));
+                }
+            }
+        }
+    }
+} 

@@ -5,13 +5,13 @@ use log::{debug, trace};
 use thiserror::Error;
 use vulkano::{
     Version, VulkanLibrary,
+    descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo},
     device::{
-        Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo,
-        QueueFlags, physical::PhysicalDevice,
+        Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
+        physical::PhysicalDevice,
     },
     instance::{Instance, InstanceCreateInfo},
 };
-use vulkano_taskgraph::descriptor_set::BindlessContext;
 
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -35,6 +35,7 @@ pub enum VulkanInitError {
 pub struct Vulkan {
     pub(crate) device: Arc<Device>,
     pub(crate) queue: Arc<Queue>,
+    pub(crate) descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 }
 
 impl Vulkan {
@@ -43,16 +44,10 @@ impl Vulkan {
         let version = vklib.api_version();
         debug!("Vulkan version: {version}");
         if version.minor < 2 {
-            return Err(VulkanInitError::IncompatibleVulkanVersion {
-                have: version,
-                want: Version::major_minor(1, 2),
-            });
+            return Err(VulkanInitError::IncompatibleVulkanVersion { have: version, want: Version::major_minor(1, 2) });
         }
         let instance = Instance::new(&vklib, &InstanceCreateInfo::default())?;
         trace!("Created vulkan instance");
-
-        let required_features = BindlessContext::required_features(&instance);
-        let required_extensions = BindlessContext::required_extensions(&instance);
 
         let physical_device: Arc<PhysicalDevice> = instance
             .enumerate_physical_devices()
@@ -62,10 +57,7 @@ impl Vulkan {
                     "Available device: {} ({:?}), {}",
                     dev.properties().device_name,
                     dev.properties().device_type,
-                    dev.properties()
-                        .driver_name
-                        .as_deref()
-                        .unwrap_or("no driver name"),
+                    dev.properties().driver_name.as_deref().unwrap_or("no driver name"),
                 )
             })
             .map(|dev| match dev.properties().device_type {
@@ -78,12 +70,8 @@ impl Vulkan {
             .sorted_by_key(|(i, _dev)| *i)
             .map(|(_, dev)| dev)
             .find(|p| {
-                p.supported_extensions().contains(&required_extensions)
-                    && p.supported_features().contains(&required_features)
-                // && p.supported_extensions().contains(&DeviceExtensions {
-                //     ext_subgroup_size_control: true,
-                //     ..Default::default()
-                // })
+                p.supported_extensions()
+                    .contains(&DeviceExtensions { ext_subgroup_size_control: true, ..Default::default() })
             })
             .ok_or(VulkanInitError::NoDeviceFound)?;
 
@@ -100,36 +88,37 @@ impl Vulkan {
         let (device, mut queues) = Device::new(
             &physical_device,
             &DeviceCreateInfo {
-                enabled_features: &required_features.union(&DeviceFeatures {
+                enabled_features: &DeviceFeatures {
                     uniform_buffer_standard_layout: true,
-                    runtime_descriptor_array: true,
                     buffer_device_address: true,
 
+                    subgroup_broadcast_dynamic_id: true,
                     subgroup_size_control: true,
-                    storage_buffer16_bit_access: true,
-                    shader_float16: true,
                     ..Default::default()
-                }),
-                enabled_extensions: &required_extensions.union(&DeviceExtensions {
+                },
+                enabled_extensions: &DeviceExtensions {
                     ext_subgroup_size_control: true,
                     khr_buffer_device_address: true,
-                    ext_descriptor_indexing: true,
                     ..Default::default()
-                }),
-                queue_create_infos: &[QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
+                },
+                queue_create_infos: &[QueueCreateInfo { queue_family_index, ..Default::default() }],
                 ..Default::default()
             },
         )?;
         trace!("Created device");
-        let queue = queues.next().expect("there should be exactly 1 queue, since 1 queue family index was supplied to Device::new");
+        let queue = queues
+            .next()
+            .expect("there should be exactly 1 queue, since 1 queue family index was supplied to Device::new");
         trace!(
             "Vulkan initialized with queue family index {}, queue index {}",
             queue.queue_family_index(),
             queue.queue_index()
         );
-        Ok(Self { device, queue })
+
+        let descriptor_set_allocator = StandardDescriptorSetAllocator::new(
+            &device,
+            &StandardDescriptorSetAllocatorCreateInfo { set_count: 1, ..Default::default() },
+        );
+        Ok(Self { device, queue, descriptor_set_allocator: descriptor_set_allocator.into() })
     }
 }

@@ -1,0 +1,272 @@
+$include["macros.gpp"]
+// TRIM_ABOVE
+#version 460
+#include "extensions.glsl"
+#include "common.gpp.glsl"
+
+const uint WG_SIZE_X = 16;
+const uint WG_SIZE_Y = 4;
+layout(local_size_x = WG_SIZE_X, local_size_y = WG_SIZE_Y) in;
+
+const uint N_BINS = 36;
+const float BIN_ANGLE_STEP = float(N_BINS) / (2 * PI);
+
+layout(push_constant) uniform KeypointOrientationPc {
+    ExtremumLocations extremum_locations;
+    FilteredExtrema filtered_extrema;
+    KeypointIndices keypoints;
+
+    uint width;
+    uint height;
+    uint rt_max_keypoints;
+};
+
+// This implementation is not particularly clever, but it works and is mostly waiting for image samples anyway.
+// Within subgroups though, neighboring samples could be shuffled around, only using shmem for boundaries.
+// With 4 4x4, 2 8x4 or 1 16x4 blocks "rolling" down across the patch, shmem could be used only when really necessary.
+
+// TODO: A lot of this space is currently wasted. At any time, we need either:
+// - 16 * 5 patch samples 
+// - 256 weights (16bit), 256 bins (8bit), raw_hist
+// - raw_hist, finalhist
+shared float sh_hist[N_BINS];
+shared float sh_rawhist[N_BINS + 4];
+shared float sh_hist_localmax_thresh;
+shared uint sh_weights[2 * WG_SIZE_X * WG_SIZE_Y];
+
+const int BUF_ROWS = int(WG_SIZE_Y) + 2;
+shared float sh_patch[WG_SIZE_X * BUF_ROWS];
+
+// Pixel values are between 0 and 1.
+const float MAX_MAGNITUDE = sqrt(2.0) + 1e-1;
+
+uint pack_fixed_point_16(float w) {
+    @ASSERT(0 <= w && w < MAX_MAGNITUDE; "%f"; w);
+    const float f = clamp(w / MAX_MAGNITUDE, 0, 1);
+    const uint fp = uint(round(f * float(1 << 16)));
+    return fp;
+}
+
+float unpack_fixed_point_16(uint packed) {
+    return float(packed) / float(1 << 16) * MAX_MAGNITUDE;
+}
+
+
+void main() {
+    // number of workgroups = number of filtered extrema, so WorkGroupID.x is a valid index
+    const uint extremum_idx = filtered_extrema.indices[gl_WorkGroupID.x];
+
+    const int local_x = int(gl_LocalInvocationID.x);
+    const int local_y = int(gl_LocalInvocationID.y);
+
+    // The 0th layer in the image pyramid is downsampled by this factor.
+    const float base_scale = 1.0;
+
+    const ivec2 texture_size = textureSize(@texture_patch_pyr, 0);
+    const float kp_x = get_extremum_x_float(extremum_locations, extremum_idx) * base_scale;
+    const float kp_y = get_extremum_y_float(extremum_locations, extremum_idx) * base_scale;
+    const float kp_size = get_extremum_scale_float(extremum_locations, extremum_idx) * base_scale;
+
+    // TODO: make sure the polynomial fix scale thing doesnt mess up scale -> scale level calculation
+    const uint kp_scale_level = uint(round(log2(kp_size / (DOG_FIRST_SCALE_SIGMA * DOG_SIGMA_RADIUS_FACTOR))));
+
+    const int layer = int(kp_scale_level);
+    const float width_scaled = width * base_scale;
+    const float height_scaled = height * base_scale;
+
+    const float radius = 3 * 1.5 * kp_size / DOG_SIGMA_RADIUS_FACTOR;
+    const float sigma = 1.5 * kp_size / DOG_SIGMA_RADIUS_FACTOR;
+
+    for (uint i = gl_LocalInvocationIndex; i < sh_rawhist.length(); i += WG_SIZE_X * WG_SIZE_Y) {
+        sh_rawhist[i] = 0;
+    }
+
+    const float step = radius / 8.0;
+    const int x_patch = int(local_x) - 8;
+    const float x_img = kp_x + float(x_patch) * step;
+
+    int sample_index = 0;
+    float my_weights[4];
+    uint my_bins[4];
+    float my_samples[4];
+
+    [[unroll]]
+    for (uint i = 0; i < 4; i ++) {
+        const int y_patch = int(local_y + WG_SIZE_Y * i) - 8;
+        const float y_img = kp_y + float(y_patch) * step;
+
+        const bool valid_px = 0 <= x_img && x_img < width_scaled && 0 <= y_img && y_img < height_scaled;
+        if (valid_px) {
+            const float sample_x = (x_img + 0.5) / float(texture_size.x);
+            const float sample_y = (y_img + 0.5) / float(texture_size.y);
+            my_samples[i] = textureLod(
+                sampler2D(@texture_patch_pyr, @sampler_nn),
+                vec2(sample_x, sample_y),
+                layer
+            ).r;
+        } else {
+            my_samples[i] = -1.0;
+        }
+        my_bins[i] = N_BINS + 1; // set to invalid
+        my_weights[i] = 0;
+    }
+
+    int rb_row_idx = 0;
+
+    for (int i = 0; i < 4; i++) {
+        const int window_start = i * 4;
+        const int need_samples_until = min(window_start + 4, 15);
+        const int y_abs = window_start + local_y;
+        while (4 * sample_index + local_y <= need_samples_until) {
+            @ASSERT(sample_index < 4);
+            const uint sample_position = 4 * sample_index + local_y;
+            const uint row = (rb_row_idx + sample_position - window_start) % BUF_ROWS;
+            sh_patch[row * WG_SIZE_X + local_x] = my_samples[sample_index];
+            sample_index++;
+        }
+        barrier();
+        const int my_row = ((rb_row_idx + local_y) % BUF_ROWS)*int(WG_SIZE_X);
+        @ASSERT(sh_patch[my_row + local_x] == my_samples[y_abs/4]);
+
+        const bool single_diff_x = (local_x == 0) || (local_x == 15);
+        const float xl = sh_patch[((rb_row_idx + local_y) % BUF_ROWS) * WG_SIZE_X + max(local_x, 1) - 1];
+        const float xr = sh_patch[((rb_row_idx + local_y) % BUF_ROWS) * WG_SIZE_X + min(local_x, 14) + 1];
+
+        const bool single_diff_y = (y_abs == 0) || (y_abs == 15);
+        const uint row_above = (y_abs > 0) ? (local_y + BUF_ROWS - 1) : local_y;
+        const uint row_below = (y_abs < 15) ? (local_y + 1) : local_y;
+        const float yu = sh_patch[((rb_row_idx + row_above) % BUF_ROWS) * WG_SIZE_X + local_x];
+        const float yd = sh_patch[((rb_row_idx + row_below) % BUF_ROWS) * WG_SIZE_X + local_x];
+
+        if (xl >= 0 && xr >= 0 && yu >= 0 && yd >= 0) {
+            const float grad_x = (xr - xl) * (single_diff_x ? 2.0 : 1.0);
+            const float grad_y = (yu - yd) * (single_diff_y ? 2.0 : 1.0);
+            const int y_patch = y_abs - 8;
+            const float distance_sq = float((x_patch * x_patch + y_patch * y_patch) * step * step);
+            const float grad_mag = sqrt(grad_x * grad_x + grad_y * grad_y);
+
+            const float angle = atan(grad_y, grad_x);
+            const int raw_bin = int(round(angle * BIN_ANGLE_STEP));
+            const uint bin = raw_bin < 0 ? raw_bin + N_BINS : (raw_bin >= N_BINS ? raw_bin - N_BINS : raw_bin);
+            my_weights[i] = grad_mag * exp(-distance_sq / (2.0 * sigma * sigma));
+            @ASSERT(bin < N_BINS);
+            my_bins[i] = bin;
+        }
+
+        rb_row_idx = (rb_row_idx + 4) % BUF_ROWS;
+        barrier();
+    }
+
+    @ASSERT(gl_LocalInvocationIndex < sh_patch.length());
+    sh_patch[gl_LocalInvocationIndex] = uintBitsToFloat(uint(my_bins[0]) | (uint(my_bins[1]) << 8) | (uint(my_bins[2]) << 16) | (uint(my_bins[3]) << 24));
+    const uint packed1 = pack_fixed_point_16(my_weights[0]) | (pack_fixed_point_16(my_weights[1]) << 16);
+    const uint packed2 = pack_fixed_point_16(my_weights[2]) | (pack_fixed_point_16(my_weights[3]) << 16);
+    @ASSERT(2 * gl_LocalInvocationIndex + 1 < sh_weights.length());
+    sh_weights[2 * gl_LocalInvocationIndex] = packed1;
+    sh_weights[2 * gl_LocalInvocationIndex + 1] = packed2;
+
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0) {
+        for (int i = 0; i < WG_SIZE_X * WG_SIZE_Y; i++) {
+            uint bins = floatBitsToUint(sh_patch[i]);
+            uint weights01 = sh_weights[2 * i];
+            float weight0 = unpack_fixed_point_16(weights01 & 0xffff);
+            float weight1 = unpack_fixed_point_16(weights01 >> 16);
+
+            uint weights12 = sh_weights[2 * i + 1];
+            float weight2 = unpack_fixed_point_16(weights12 & 0xffff);
+            float weight3 = unpack_fixed_point_16(weights12 >> 16);
+            uint bin0 = (bins >>  0) & 0xff;
+            uint bin1 = (bins >>  8) & 0xff;
+            uint bin2 = (bins >> 16) & 0xff;
+            uint bin3 = (bins >> 24) & 0xff;
+            if (bin0 < N_BINS) { sh_rawhist[2 + bin0] += weight0; }
+            if (bin1 < N_BINS) { sh_rawhist[2 + bin1] += weight1; }
+            if (bin2 < N_BINS) { sh_rawhist[2 + bin2] += weight2; }
+            if (bin3 < N_BINS) { sh_rawhist[2 + bin3] += weight3; }
+        }
+        sh_rawhist[1] = sh_rawhist[N_BINS + 1];
+        sh_rawhist[0] = sh_rawhist[N_BINS];
+        sh_rawhist[N_BINS + 2] = sh_rawhist[2];
+        sh_rawhist[N_BINS + 3] = sh_rawhist[3];
+    }
+    barrier(); 
+
+    if (gl_SubgroupSize >= 8) {
+        for (uint sg_start = gl_SubgroupID * (gl_SubgroupSize - 4); sg_start < N_BINS; sg_start += gl_NumSubgroups * (gl_SubgroupSize - 4)) {
+            const uint i = sg_start + gl_SubgroupInvocationID;
+            if (i < sh_rawhist.length()) {
+                const float hist_val = sh_rawhist[i];
+                float conv = 6.0/16.0 * hist_val;
+                const float left2 = subgroupShuffleUp(hist_val, 2);
+                const float left1 = subgroupShuffleUp(hist_val, 1);
+                const float right2 = subgroupShuffleDown(hist_val, 2);
+                const float right1 = subgroupShuffleDown(hist_val, 1);
+                if (i >= 2 && i < sh_rawhist.length() - 2 && 2 <= gl_SubgroupInvocationID && gl_SubgroupInvocationID < gl_SubgroupSize - 2) {
+                    conv += 4.0/16.0 * (left1 + right1);
+                    conv += 1.0/16.0 * (left2 + right2);
+                    sh_hist[i - 2] = conv;
+                }
+            }
+        }
+    } else {
+        if (gl_LocalInvocationIndex < N_BINS) {
+            const uint rawbin = gl_LocalInvocationIndex + 2;
+            sh_hist[gl_LocalInvocationIndex] = (sh_rawhist[rawbin - 2] + sh_rawhist[rawbin + 2]) * 1.0/16.0 
+                + (sh_rawhist[rawbin - 1] + sh_rawhist[rawbin + 1]) * 4.0/16.0 
+                + sh_rawhist[rawbin] * 6.0/16.0;
+        }
+    }
+
+    barrier();
+
+    const uint MAX_MULTIPLE = 4;
+    if (gl_SubgroupID == 0) {
+        float current_max = 0;
+        float maxima[MAX_MULTIPLE];
+        uint n_maxima = 0;
+        for (uint i = gl_SubgroupInvocationID; i < N_BINS; i += gl_SubgroupSize) {
+            const float val = sh_hist[i];
+            current_max = max(current_max, subgroupMax(val));
+        }
+        const float localmax_thresh = current_max * 0.8;
+        for (uint i = gl_SubgroupInvocationID; i < N_BINS; i += gl_SubgroupSize) {
+            const float val = sh_hist[i];
+            const float right = sh_hist[(i + 1) % N_BINS];
+            const float left = sh_hist[(i + N_BINS - 1) % N_BINS];
+            const bool is_localmax = val > localmax_thresh && val > right && val > left;
+
+            float angle;
+            if (is_localmax) {
+                const float interp = (left - right) / (left - 2 * val + right);
+                const float raw_bin = float(i) + interp / 2.0;
+                const float bin = raw_bin < 0 ? (raw_bin + N_BINS) : (raw_bin > N_BINS ? (raw_bin - N_BINS) : raw_bin);
+                angle = 360.0 - (360.0 / float(N_BINS)) * bin;
+            }
+
+            int m = is_localmax ? int(gl_SubgroupInvocationID) : -1;
+            int max_sg = subgroupMax(m);
+            sample_index = int(gl_SubgroupSize) + 1; // Be extra sure the loop is bounded
+            while (max_sg >= 0 && sample_index-- > 0) {
+                if (max_sg == gl_SubgroupInvocationID) {
+                    m = -1;
+                }
+                const float max_angle = subgroupBroadcast(angle, uint(max_sg));
+                if (subgroupElect() && n_maxima < MAX_MULTIPLE) {
+                    maxima[n_maxima] = max_angle;
+                    n_maxima++;
+                }
+                max_sg = subgroupMax(m);
+            }
+            @ASSERT(sample_index > 0);
+        }
+        if (subgroupElect()) {
+            const uint first_idx = atomicAdd(keypoints.n_keypoints, n_maxima);
+            for (uint i = 0; i < n_maxima && first_idx + i < rt_max_keypoints; i++) {
+                keypoints.data[first_idx + i] = extremum_idx;
+                keypoints.data[MAX_KEYPOINTS + first_idx + i] = floatBitsToUint(maxima[i]);
+            }
+        }
+    }
+}

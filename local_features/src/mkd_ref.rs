@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 use itertools::Itertools as _;
-use ndarray::{
-    concatenate, s, stack, Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis,
-};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, concatenate, s, stack};
 
 const VM_FOURIER_N3_K8: &[f32] = &[0.378_723_74, 0.517_962_34, 0.468_820_15, 0.397_980_96];
 const VM_FOURIER_N1_K1: &[f32] = &[0.618_176, 0.693_472_5];
@@ -23,12 +21,9 @@ pub struct Mkd {
     whitening: Option<PCAModel>,
 }
 
-pub(crate) const PCA_SAFETENSORS_LIBERTY: &[u8] =
-    include_bytes!("../models/mkd/concat-pca-liberty.safetensors");
-pub(crate) const PCA_SAFETENSORS_NOTREDAME: &[u8] =
-    include_bytes!("../models/mkd/concat-pca-notredame.safetensors");
-pub(crate) const PCA_SAFETENSORS_YOSEMITE: &[u8] =
-    include_bytes!("../models/mkd/concat-pca-yosemite.safetensors");
+pub(crate) const PCA_SAFETENSORS_LIBERTY: &[u8] = include_bytes!("../models/mkd/concat-pca-liberty.safetensors");
+pub(crate) const PCA_SAFETENSORS_NOTREDAME: &[u8] = include_bytes!("../models/mkd/concat-pca-notredame.safetensors");
+pub(crate) const PCA_SAFETENSORS_YOSEMITE: &[u8] = include_bytes!("../models/mkd/concat-pca-yosemite.safetensors");
 
 impl Mkd {
     pub fn new(opts: &MkdOptions) -> Self {
@@ -37,14 +32,11 @@ impl Mkd {
             Whitening::PcaAttenutated => {
                 // let bytes = std::fs::read("models/mkd/concat-pca-liberty.safetensors")
                 //     .expect("TODO unhandled");
-                let model =
-                    PCAModel::from_safetensors(PCA_SAFETENSORS_LIBERTY).expect("TODO unhandled");
+                let model = PCAModel::from_safetensors(PCA_SAFETENSORS_LIBERTY).expect("TODO unhandled");
                 Some(model)
             }
         };
-        Self {
-            whitening: pca_model,
-        }
+        Self { whitening: pca_model }
     }
 
     pub fn descriptor_size(&self) -> u32 {
@@ -58,11 +50,7 @@ impl Mkd {
         let desc = mkd(patch);
         match &self.whitening {
             None => desc,
-            Some(PCAModel {
-                mean,
-                eigvals,
-                eigvecs,
-            }) => {
+            Some(PCAModel { mean, eigvals, eigvecs }) => {
                 let t = 0.7;
                 let m = -0.5 * t;
                 let out_dims = 128;
@@ -146,16 +134,11 @@ pub(crate) fn cart2pol(arr: &ArrayView3<f32>) -> Array3<f32> {
 fn von_mises(arr: &ArrayView2<f32>, coeffs: &[f32]) -> Array3<f32> {
     assert_eq!(arr.shape(), [32, 32]);
     let n = coeffs.len() - 1;
-    let weights: Array1<f32> = coeffs
-        .iter()
-        .copied()
-        .chain(coeffs.iter().copied().skip(1))
-        .collect();
+    let weights: Array1<f32> = coeffs.iter().copied().chain(coeffs.iter().copied().skip(1)).collect();
     assert_eq!(weights.len(), 2 * n + 1);
     // 1 * arr, 2 * arr, .., n * arr
     let frange = (1..=n).map(|a| arr * a as f32).collect_vec();
-    let frange: Array3<f32> =
-        stack(Axis(0), &frange.iter().map(|a| a.view()).collect_vec()).unwrap();
+    let frange: Array3<f32> = stack(Axis(0), &frange.iter().map(|a| a.view()).collect_vec()).unwrap();
     assert_eq!(frange.shape(), [n, 32, 32]);
     let emb0 = Array3::ones([1, 32, 32]);
     //
@@ -164,9 +147,7 @@ fn von_mises(arr: &ArrayView2<f32>, coeffs: &[f32]) -> Array3<f32> {
     // coeff[0] ++ coeffs[1..] ++ coeffs[1..]
     let mut cat = concatenate(Axis(0), &[emb0.view(), emb1.view(), emb2.view()]).unwrap();
     assert_eq!(cat.shape(), [2 * n + 1, 32, 32]);
-    cat.axis_iter_mut(Axis(0))
-        .zip(weights)
-        .for_each(|(mut v, w)| v *= w);
+    cat.axis_iter_mut(Axis(0)).zip(weights).for_each(|(mut v, w)| v *= w);
     cat
 }
 
@@ -220,8 +201,7 @@ pub(crate) fn spatial_kernel_embedding_cart() -> Array3<f32> {
         for j in 0..emb_b.shape()[0] {
             for r in 0..32 {
                 for c in 0..32 {
-                    spatial_kernel[(i * emb_b.shape()[0] + j, r, c)] =
-                        emb_a[(i, r, c)] * emb_b[(j, r, c)];
+                    spatial_kernel[(i * emb_b.shape()[0] + j, r, c)] = emb_a[(i, r, c)] * emb_b[(j, r, c)];
                 }
             }
         }
@@ -230,10 +210,20 @@ pub(crate) fn spatial_kernel_embedding_cart() -> Array3<f32> {
     spatial_kernel
 }
 
+pub(crate) fn spatial_embedding_polar_nokronecker() -> Array3<f32> {
+    let grid = cart2pol(&mesh_grid().view());
+    let rho = grid.slice(s![0, .., ..]).to_owned() * std::f32::consts::PI / std::f32::consts::SQRT_2;
+    let phi = grid.slice(s![1, .., ..]).to_owned() * -1.;
+    let emb_a = von_mises(&phi.view(), VM_FOURIER_N2_K8);
+    assert_eq!(emb_a.shape(), [5, 32, 32]);
+    let emb_b = von_mises(&rho.view(), VM_FOURIER_N2_K8);
+    assert_eq!(emb_b.shape(), [5, 32, 32]);
+    ndarray::concatenate![Axis(0), emb_a, emb_b]
+}
+
 pub(crate) fn spatial_kernel_embedding_polar() -> Array3<f32> {
     let grid = cart2pol(&mesh_grid().view());
-    let rho =
-        grid.slice(s![0, .., ..]).to_owned() * std::f32::consts::PI / std::f32::consts::SQRT_2;
+    let rho = grid.slice(s![0, .., ..]).to_owned() * std::f32::consts::PI / std::f32::consts::SQRT_2;
     let phi = grid.slice(s![1, .., ..]).to_owned() * -1.;
     let emb_a = von_mises(&phi.view(), VM_FOURIER_N2_K8);
     assert_eq!(emb_a.shape(), [5, 32, 32]);
@@ -246,8 +236,7 @@ pub(crate) fn spatial_kernel_embedding_polar() -> Array3<f32> {
         for j in 0..emb_b.shape()[0] {
             for r in 0..32 {
                 for c in 0..32 {
-                    spatial_kernel[(i * emb_b.shape()[0] + j, r, c)] =
-                        emb_a[(i, r, c)] * emb_b[(j, r, c)];
+                    spatial_kernel[(i * emb_b.shape()[0] + j, r, c)] = emb_a[(i, r, c)] * emb_b[(j, r, c)];
                 }
             }
         }
@@ -328,16 +317,9 @@ fn mkd(patch: &ArrayView2<f32>) -> Array1<f32> {
 
 fn mkd_pca_att(patch: &ArrayView2<f32>) -> Array1<f32> {
     let desc = mkd(patch);
-    let PCAModel {
-        mean,
-        eigvals,
-        eigvecs,
-    } = PCAModel::from_safetensors(
-        std::fs::read("models/mkd/concat-pca-liberty.safetensors")
-            .unwrap()
-            .as_slice(),
-    )
-    .unwrap();
+    let PCAModel { mean, eigvals, eigvecs } =
+        PCAModel::from_safetensors(std::fs::read("models/mkd/concat-pca-liberty.safetensors").unwrap().as_slice())
+            .unwrap();
     let t = 0.7;
     let m = -0.5 * t;
     let out_dims = 128;
@@ -359,16 +341,12 @@ pub(crate) struct PCAModel {
 fn u8_slice_to_f32(bytes: &[u8]) -> Vec<f32> {
     // TODO: handle errors
     assert_eq!(bytes.len() % 4, 0);
-    bytes
-        .chunks_exact(4)
-        .map(|ch| f32::from_le_bytes(ch.try_into().unwrap()))
-        .collect_vec()
+    bytes.chunks_exact(4).map(|ch| f32::from_le_bytes(ch.try_into().unwrap())).collect_vec()
 }
 
 impl PCAModel {
     pub fn from_safetensors(bytes: &[u8]) -> Result<Self, safetensors::SafeTensorError> {
-        let model =
-            safetensors::SafeTensors::deserialize(bytes).expect("error deserializing safetensors");
+        let model = safetensors::SafeTensors::deserialize(bytes).expect("error deserializing safetensors");
         let mean = model.tensor("mean")?;
         assert_eq!(mean.shape(), [238]);
         let mean_vec: Vec<f32> = u8_slice_to_f32(mean.data());
@@ -377,13 +355,9 @@ impl PCAModel {
         let eigvecs = model.tensor("eigvecs")?;
         let eigvecs_vec = u8_slice_to_f32(eigvecs.data());
         Ok(PCAModel {
-            mean: Array1::from_shape_vec(mean.shape()[0], mean_vec.to_owned())
-                .expect("mean has wrong shape"),
-            eigvecs: Array2::from_shape_vec(
-                (eigvecs.shape()[0], eigvecs.shape()[1]),
-                eigvecs_vec.to_owned(),
-            )
-            .expect("eigvecs has wrong shape"),
+            mean: Array1::from_shape_vec(mean.shape()[0], mean_vec.to_owned()).expect("mean has wrong shape"),
+            eigvecs: Array2::from_shape_vec((eigvecs.shape()[0], eigvecs.shape()[1]), eigvecs_vec.to_owned())
+                .expect("eigvecs has wrong shape"),
             eigvals: Array1::from_shape_vec(eigvals.shape()[0], eigvals_vec.to_owned())
                 .expect("eigvals has wrong shape"),
         })

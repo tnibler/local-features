@@ -23,6 +23,7 @@ fn main() {
                 .to_str()
                 .unwrap(),
         )
+        .clang_arg(format!("-I{}", &vulkan_sift_include_path))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");

@@ -1,0 +1,29 @@
+$define[@STRINGMODE; Sss "\\\"" "\\\"" "\\\\"]
+$mode[string; @STRINGMODE]
+
+$ifdef[ENABLE_ASSERTIONS]
+
+$define[@UNQUOTE;$mode[string; QSs "\"" "\"" "\\"]$defeval[@ASIS;#1]@ASIS$undef[ASIS]$mode[string; @STRINGMODE]]
+
+$define[@ASSERT(expr; msg; args); ( @expr || (printf(\"Assertion failed: @expr, $file:$line$ifneq[@msg;]\\n@UNQUOTE(@msg)\\n\", @args$else\\n\"$endif\), false) )]
+
+$define[@BOUNDS_CHECK(idx; len); ( (@idx) < @len ? (@idx) : (printf(\"Index out of bounds: @arr at %d \\n__FILE__: __LINE__\\n\", @idx) $ifneq[@args;],printf(@args))$endif, 0)) ]
+$define[@INDEX(arr; idx); @arr[@BOUNDS_CHECK(@idx; @arr.length())]]
+
+$else
+
+$define[@ASSERT(expr; args); @expr]
+$define[@INDEX(arr; idx); @arr\[@idx\]]
+
+$endif
+$mode[push]
+
+$define[@texture_scratch; textures[0]]
+$define[@texture_patch_pyr_scratch; textures[1]]
+$define[@texture_patch_pyr; textures[2]]
+$define[@image_scratch; images[0]]
+$define[@image_patch_pyr_scratch; images[1]]
+$define[@image_patch_pyr_mip(level); images[2 + @level]]
+
+$define[@sampler_bil; samplers[0]]
+$define[@sampler_nn; samplers[1]]

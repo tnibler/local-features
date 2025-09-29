@@ -21,7 +21,7 @@ fn make_local_features(
     local_features::new_vulkan(
         vulkan,
         local_features::BuildTimeParams {
-            n_scales: 4,
+            n_scales: 5,
             max_image_width: width,
             max_image_height: height,
             max_features: MAX_FEATURES,
@@ -146,7 +146,14 @@ impl App for WebcamDemo {
         let extract_start = std::time::Instant::now();
         let feature_result = self
             .local_features
-            .detect_top_n(&img_arr.view(), self.limit_features, self.min_feature_size)
+            .detect_top_n(
+                &img_arr.view(),
+                self.limit_features,
+                &local_features::FeatureDetectParams {
+                    min_keypoint_scale: self.min_feature_size,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let extract_time = extract_start.elapsed();
         let keypoints_this_frame = feature_result.keypoints.clone();

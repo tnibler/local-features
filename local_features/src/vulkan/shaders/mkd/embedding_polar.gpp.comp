@@ -1,0 +1,163 @@
+$include["../macros.gpp"]
+// TRIM_ABOVE
+
+#version 460
+#include "../extensions.glsl"
+#include "../common.gpp.glsl"
+#include "swizzle.gpp.glsl"
+#include "embedding_common.glsl"
+
+
+const uint N_FOURIER_COEFFS = 3;
+// N=2, kappa=8
+const float FOURIER_COEFFS[N_FOURIER_COEFFS] = {0.37872374, 0.51796234, 0.46882015};
+
+const uint N_FREQS = N_FOURIER_COEFFS - 1;
+const uint N_COMPONENTS = 2 * N_FREQS + 1;
+const uint DIMS_EMB = N_COMPONENTS * N_COMPONENTS;
+const uint DIMS_EMB_STRIDE = DIMS_EMB;
+
+const uint WG_SIZE = 64;
+layout(local_size_x = WG_SIZE) in;
+
+const uint MAX_NUM_SUBGROUPS = WG_SIZE / MIN_SUBGROUP_SIZE;
+
+layout(push_constant) uniform EmbedPc {
+    KeypointIndices keypoints;
+    ConstantData consts;
+    PatchBuffer patch_gradients;
+    EmbeddingBuffer embeddings;
+};
+
+
+// group_angle: angle/argument of pixel in top left quadrant
+float get_embedding_coeff_angle(uint dim, float group_angle) {
+    @ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
+    if (dim == 0) {
+        return FOURIER_COEFFS[0];
+    }
+    if (dim <= N_FREQS) {
+        return FOURIER_COEFFS[dim] * cos(dim * group_angle);
+    } else {
+        return FOURIER_COEFFS[dim - N_FREQS] * sin((dim - N_FREQS) * group_angle);
+    }
+}
+
+vec4 get_embedding_angle_symmetry(uint dim) {
+    switch (dim) {
+        case 0:
+            return vec4(1);
+        case 1:
+            return vec4(1, -1, 1, -1);
+        case 2:
+            return vec4(1);
+        case 3:
+            return vec4(1, 1, -1, -1);
+        case 4:
+            return vec4(1, -1, -1, 1);
+    }
+}
+
+float get_embedding_coeff_magnitude(uint dim, float mmag) {
+    @ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
+    const float mag = mmag * PI / sqrt(2);
+    if (dim == 0) {
+        return FOURIER_COEFFS[0];
+    }
+    if (dim <= N_FREQS) {
+        return FOURIER_COEFFS[dim] * cos(dim * mag) * 1;
+    } else {
+        return FOURIER_COEFFS[dim - N_FREQS] * sin((dim - N_FREQS) * mag) * 1;
+    }
+}
+
+// FIXME: specialization const and tied to number of dispatch workgroups pls
+const uint IN_DIMS_PER_WG = 7;
+
+shared float sh_embeddings[IN_DIMS_PER_WG * DIMS_EMB * MAX_NUM_SUBGROUPS];
+
+void main() {
+    const uint patch_index = gl_WorkGroupID.x;
+
+    if (patch_index >= min(MAX_KEYPOINTS, keypoints.n_keypoints)) {
+      return;
+    }
+
+    const uint start_in_dim = gl_WorkGroupID.y * IN_DIMS_PER_WG;
+    const uint end_in_dim = min(start_in_dim + IN_DIMS_PER_WG, DIMS_INPUT);
+    const uint n_in_dims = end_in_dim - start_in_dim;
+
+    for (uint i = gl_LocalInvocationIndex; i < (n_in_dims * DIMS_EMB * gl_NumSubgroups); i += WG_SIZE) {
+        sh_embeddings[i] = 0;
+    }
+    barrier();
+
+    for (uint load4_idx = gl_LocalInvocationIndex; load4_idx < PATCH_SIZE * PATCH_SIZE / 4; load4_idx += WG_SIZE) {
+        const uint scalar_index = 4 * load4_idx;
+        const uvec2 pos = unswizzle_index(scalar_index);
+        const float normalized_x = normalized_pos(pos.x);
+        const float normalized_y = normalized_pos(pos.y);
+        const float weight = gaussian_weight(normalized_x, normalized_y); 
+
+        const vec4 embedded_mag = Vec4Buf(patch_gradients).data[patch_index * PATCH_SIZE * PATCH_SIZE / 4 + load4_idx];
+        const vec4 ori = Vec4Buf(patch_gradients).data[MAX_KEYPOINTS * PATCH_SIZE * PATCH_SIZE / 4 + patch_index * PATCH_SIZE * PATCH_SIZE / 4 + load4_idx];
+
+        const float group_angle = atan(
+            normalized_y,
+            normalized_x
+        );
+
+        [[loop]]
+        for (uint wg_in_dim = 0, in_dim = start_in_dim; in_dim < end_in_dim; wg_in_dim++, in_dim++) {
+            const float in_dim_coeff = von_mises_n3k8_coeff(in_dim);
+            vec4 embedded_grad = vec4(in_dim_coeff * weight);
+            const bool need_ori = in_dim > 0;
+            if (need_ori) {
+                const vec4 px_angle = group_angle * vec4(1, -1, -1, 1) + vec4(0, -PI, 0, PI);
+                const vec4 relative_ori = ori - px_angle;
+                if (in_dim < 3 + 1) {
+                    embedded_grad *= cos(float(in_dim) * relative_ori);
+                } else {
+                    embedded_grad *= sin(float(in_dim - 3) * relative_ori);
+                }
+            }
+            embedded_grad *= embedded_mag;
+
+            for (uint dim_angle = 0; dim_angle < N_COMPONENTS; dim_angle++) {
+                [[unroll]]
+                for (uint dim_mag = 0; dim_mag < N_COMPONENTS; dim_mag++) {
+                    // Storing precomputed coeffs is most likely not worth the 8 registers
+                    const float px_magnitude = sqrt(float(normalized_x * normalized_x + normalized_y * normalized_y) + 1e-8);
+                    const float coeff_mag = get_embedding_coeff_magnitude(dim_mag, px_magnitude);
+                    const float coeff_angle = get_embedding_coeff_angle(dim_angle, group_angle);
+                    const vec4 result = embedded_grad * coeff_angle * coeff_mag * get_embedding_angle_symmetry(dim_angle);
+                    const float sum = result.x + result.y + result.z + result.w;
+
+                    const float sg_result = subgroupAdd(sum);
+                    const uint dim_emb = dim_angle * N_COMPONENTS + dim_mag;
+                    const uint dim_idx = wg_in_dim * DIMS_EMB + dim_emb; 
+
+                    // No accumulator in register, vector register pressure is high so it hurts more than anything
+                    if (subgroupElect()) {
+                        sh_embeddings[gl_SubgroupID * IN_DIMS_PER_WG * DIMS_EMB + dim_idx] += sg_result;
+                    }
+                }
+            }
+        }
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        for (uint sg = 1; sg < gl_NumSubgroups; sg++) {
+            for (uint dim = gl_SubgroupInvocationID; dim < n_in_dims * DIMS_EMB; dim += gl_SubgroupSize) {
+                sh_embeddings[dim] += sh_embeddings[sg * IN_DIMS_PER_WG * DIMS_EMB + dim];
+            }
+        }
+    }
+    barrier();
+
+    const uint offset = embedding_offset_polar(patch_index, start_in_dim, 0);
+    for (uint i = gl_LocalInvocationIndex; i < n_in_dims * DIMS_EMB; i += WG_SIZE) {
+        embeddings.data[offset + i] = sh_embeddings[i];
+    }
+}

@@ -34,19 +34,23 @@ pub enum MKDPCA {
 #[derive(Debug, Clone)]
 /// Algorithm-related parameters that can be adjusted at runtime
 pub struct FeatureDetectParams {
-    pub patch_scale_factor: f32,
     // pub fix_scale: bool,
-    // pub cm_low: f32,
-    // pub cm_high: f32,
+    pub extremum_min_response: f32,
+    pub edgeness_cm_low: f32,
+    pub edgeness_cm_high: f32,
+    pub min_keypoint_scale: f32,
+    pub patch_scale_factor: f32,
 }
 
 impl Default for FeatureDetectParams {
     fn default() -> Self {
         Self {
-            patch_scale_factor: 24.,
-            // cm_low: 0.7,
-            // cm_high: 1.5,
+            extremum_min_response: 0.035,
+            edgeness_cm_low: 0.7,
+            edgeness_cm_high: 1.5,
+            min_keypoint_scale: 0.0,
             // fix_scale: false,
+            patch_scale_factor: 0.75,
         }
     }
 }
