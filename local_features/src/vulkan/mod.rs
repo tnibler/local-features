@@ -1743,21 +1743,29 @@ impl FilterBlobs for TopKContrastFilter {
         blobs: Box<dyn Iterator<Item = BlobLocationsView<'r>> + 'w>,
         out: FilterBlobsOutput<'w>,
     ) {
-        let (idxs, mut contrasts): (Vec<u32>, Vec<FloatOrd<f32>>) = blobs
+        let (gpu_idxs, idxs_min_size, mut contrasts_min_size): (
+            Vec<u32>,
+            Vec<usize>,
+            Vec<FloatOrd<f32>>,
+        ) = blobs
             .flat_map(|chunk| chunk.scales.iter().zip(chunk.contrasts))
             .enumerate()
             .filter(|(_i, (size, _contrast))| **size >= self.min_size)
-            .map(|(i, (_, contrast))| (i as u32, FloatOrd(-(contrast.abs()))))
-            .unzip();
+            .enumerate()
+            .map(|(idx_min_size, (gpu_idx, (_, contrast)))| {
+                (gpu_idx as u32, idx_min_size, FloatOrd(-(contrast.abs())))
+            })
+            .multiunzip();
 
-        let contrasts2 = contrasts.clone();
-        if idxs.len() <= self.n as usize {
-            out.indices.extend(idxs);
+        if gpu_idxs.len() <= self.n as usize {
+            out.indices.extend(gpu_idxs);
         } else {
-            let cutoff = order_stat::kth(&mut contrasts, self.n as usize).0.abs();
-            for idx in idxs {
-                if contrasts2[idx as usize].0.abs() >= cutoff {
-                    out.indices.push(idx);
+            let cutoff = order_stat::kth(&mut contrasts_min_size, self.n as usize)
+                .0
+                .abs();
+            for idx in idxs_min_size {
+                if contrasts_min_size[idx].0.abs() >= cutoff {
+                    out.indices.push(gpu_idxs[idx]);
                 }
                 if out.indices.len() == self.n as usize {
                     break;
