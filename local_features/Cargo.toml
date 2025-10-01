@@ -21,7 +21,7 @@ fxhash = "0.2.1"
 log = { workspace = true }
 
 [dev-dependencies]
-criterion = "0.5.1"
+criterion = { workspace = true }
 image = { workspace = true }
 imageproc = { workspace = true }
 nshare = { workspace = true }

@@ -109,12 +109,14 @@
                 (lib.fileset.fileFilter (file: file.hasExt "glsl") ./.)
                 (lib.fileset.fileFilter (file: file.hasExt "h") ./.)
                 (lib.fileset.fileFilter (file: file.hasExt "safetensors") ./.)
-                (craneLib.fileset.commonCargoSources ./local_features)
+                (craneLib.fileset.commonCargoSources ./.)
                 (craneLib.fileset.commonCargoSources crate)
                 # (craneLib.fileset.commonCargoSources ./examples)
                 # (craneLib.fileset.commonCargoSources ./local_python)
               ];
             };
+
+          vulkanSift = import ./benchmarks/VulkanSift.nix {inherit pkgs targetPkgs;};
         in {
           "match_images-${targetCfg.rustTarget}" = craneLib.buildPackage (
             individualArgs
@@ -142,6 +144,23 @@
               ];
             }
           );
+
+          "benchmarks-${targetCfg.rustTarget}" = craneLib.buildPackage (
+            individualArgs
+            // {
+              pname = "benchmarks";
+              cargoExtraArgs = "-p benchmarks";
+
+              src = fileSetForCrate ./benchmarks;
+              inherit (craneLib.crateNameFromCargoToml {inherit src;}) version;
+              buildInputs = [vulkanSift];
+
+              preConfigurePhase = ''
+                export VULKANSIFT_LIB_PATH=${vulkanSift}/lib
+                export VULKANSIFT_INCLUDE_PATH=${vulkanSift}/include
+              '';
+            }
+          );
         };
         perTargetPackages = lib.mapAttrs buildForTarget buildTargets;
       in {
@@ -158,6 +177,7 @@
               "rust-src"
             ];
           };
+          vulkanSift = import ./benchmarks/VulkanSift.nix {inherit pkgs;};
         in
           pkgs.mkShell {
             packages = with pkgs; [
@@ -177,7 +197,10 @@
               xorg.libXau
               xorg.libXdmcp
               libxkbcommon
+              shader-slang
             ];
+
+            buildInputs = [vulkanSift];
 
             env = {
               RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
@@ -186,6 +209,9 @@
               VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d:${pkgs.vulkan-tools-lunarg}/share/vulkan/explicit_layer.d";
 
               LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib"; # for v4l2 bindings, webcam example
+
+              VULKANSIFT_LIB_PATH = "${vulkanSift}/lib";
+              VULKANSIFT_INCLUDE_PATH = "${vulkanSift}/include";
 
               LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
                 shaderc

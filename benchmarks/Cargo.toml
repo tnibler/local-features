@@ -1,0 +1,23 @@
+[package]
+name = "benchmarks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+itertools.workspace = true
+
+[dev-dependencies]
+local_features = { workspace = true }
+
+criterion.workspace = true
+image.workspace = true
+ndarray.workspace = true
+nshare.workspace = true
+
+[build-dependencies]
+bindgen = "0.72.1"
+
+[[bench]]
+name = "benchmark"
+harness = false

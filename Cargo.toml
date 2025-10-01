@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["local_features", "examples/*"]
+members = ["local_features", "examples/*", "benchmarks"]
 
 [workspace.dependencies]
 local_features = { path = "./local_features/" }
 
+criterion = "0.7.0"
 log = "0.4.28"
 image = "0.25.2"
 imageproc = "0.25.0"
