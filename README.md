@@ -34,7 +34,7 @@ Run on a Ryzen 7840HS laptop, 64GB DDR5 5600MHz.
 
 <img src="./benchmarks/images/image_size.svg">
 
-<img src="./benchmarks/images/feature_count.svg.svg">
+<img src="./benchmarks/images/feature_count.svg">
 
 Quality benchmarks: no data, no claims.
 
