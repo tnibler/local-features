@@ -6,6 +6,7 @@ import polars as pl
 from pathlib import Path
 import sys
 
+
 plt.style.use(['science'])
 
 if len(sys.argv) != 2:
@@ -31,6 +32,9 @@ for res in output:
 df = pl.DataFrame(rows).with_columns(resolution=pl.format('{}x{}', pl.col('width'), pl.col('height'))) \
     .sort(pl.col('width').mul(pl.col('height')))
 
+out_dir = Path('images')
+out_dir.mkdir(exist_ok=True)
+
 g = sns.catplot(df.filter(pl.col('facet').eq('Image Size')), kind='bar', x='resolution', y='time', hue='Method')
 g.ax.set_title('Detection Time by Image Size')
 g.ax.set(xlabel='Image Size', ylabel='Time (ms)')
@@ -38,12 +42,12 @@ for ax in g.axes.flatten():
     for c in ax.containers:
         ax.bar_label(c, label_type='edge', fmt='{:.1f}')
 
-g.savefig("image_size.svg")
+g.savefig(out_dir / "image_size.svg")
 
 g = sns.catplot(df.filter(pl.col('facet').eq('Feature Count')), kind='bar', x='max_features', y='time', hue='Method')
 g.ax.set_title('Detection Time by Feature Count (4096x3072 image)')
-g.ax.set(xlabel='Image Size', ylabel='Time (ms)')
+g.ax.set(xlabel='Feature Count ', ylabel='Time (ms)')
 for ax in g.axes.flatten():
     for c in ax.containers:
         ax.bar_label(c, label_type='edge', fmt='{:.1f}')
-g.savefig("feature_count.svg")
+g.savefig(out_dir / "feature_count.svg")

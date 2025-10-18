@@ -87,9 +87,6 @@ fn do_combinations(c: &mut Criterion, name: &str, scales_max_features: &[(f32, i
 
         #[cfg(feature = "vulkansift")]
         {
-            let image = resize_image(&image, scale);
-            let width = image.width();
-            let height = image.height();
             use benchmarks::{VulkanSift, VulkanSiftConfig};
             let config = VulkanSiftConfig {
                 max_image_width: width,
@@ -112,9 +109,6 @@ fn do_combinations(c: &mut Criterion, name: &str, scales_max_features: &[(f32, i
         #[cfg(feature = "opencv")]
         {
             use opencv::prelude::Feature2DTrait;
-            let image = resize_image(&image, scale);
-            let width = image.width();
-            let height = image.height();
             let cv_image = opencv::core::Mat::new_rows_cols_with_data(
                 height as i32,
                 width as i32,
@@ -122,7 +116,7 @@ fn do_combinations(c: &mut Criterion, name: &str, scales_max_features: &[(f32, i
             )
             .unwrap();
             let mut sift =
-                opencv::features2d::SIFT::create(max_features, 3, 0.04, 10., 1.6, false).unwrap();
+                opencv::features2d::SIFT::create(max_features, 3, 0.04, 10., 1.6, true).unwrap();
             group.bench_with_input(
                 BenchmarkId::new("OpenCV SIFT", &input_name),
                 &input,
