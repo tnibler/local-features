@@ -4,12 +4,12 @@
 
 https://private-user-images.githubusercontent.com/62287652/494117038-29c6ac37-7042-4d93-bf20-4764125518f2.mp4
 
-Still experimental.
+Vulkan-based local image feature detector, combining a DoG variant described by [Ghahremani et. al](https://arxiv.org/abs/2012.00859) and Multi Kernel Descriptors by [Mukundan et. al](https://arxiv.org/abs/1811.11147).
 
-Project goals:
+Very experimental. Project goals:
 
  - Be very fast.
- - Usable on as much hardware as possible
+ - Usable on as much hardware as possible (Raspberry Pi 4/5 would be a goal)
  - With decent detecting/matching performance
 
 Roadmap:
@@ -26,15 +26,24 @@ Roadmap:
  - float16 and other missing stuff
  - Maybe better keypoint orientation estimate (SIFT histogram is almost free and quite good). Something like https://arxiv.org/abs/1511.04273 at most, everything else is way too expensive.
 
-## Build
+## Benchmarks
 
-Non-linux might break any time. `remove-linuxonly` branch definitely works for the `match_images` example.
+Comparison with OpenCV SIFT (CPU), and Maël Aubert's [VulkanSIFT](https://github.com/maelaubert/VulkanSift). Both use default SIFT parameters, including the initial 2x upscale (generally required to get good results). These are not definitive bulletproof publication-ready measurements, but to give an idea.
+
+Run on a Ryzen 7840HS laptop, 64GB DDR5 5600MHz.
+
+<img src="./benchmarks/images/image_size.svg">
+
+<img src="./benchmarks/images/feature_count.svg.svg">
+
+Quality benchmarks: no data, no claims.
+
+## Build
 
 Requirements for library (nix devshell also contains everything):
 
  - Rust
  - Vulkan SDK
-
 
 ## Examples
 
@@ -51,3 +60,7 @@ Requires `video4linux`.
 `cargo run --release --bin webcam`
 
 Pressing space will save the current video frame and extracted features (displayed on the right). Features are then matched between the camera feed and the saved image.
+
+## License
+
+This library is available under the GNU General Public License v3.
