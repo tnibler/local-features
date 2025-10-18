@@ -10,7 +10,7 @@ bench = false
 anyhow = "1.0.100"
 itertools.workspace = true
 opencv = { version = "0.96.0", optional = true, features = ["clang-runtime"] }
-local_features = { workspace = true }
+local-features = { workspace = true }
 
 [dev-dependencies]
 

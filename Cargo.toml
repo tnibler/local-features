@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["local_features", "examples/*", "benchmarks"]
+members = ["local-features", "examples/*", "benchmarks"]
 
 [workspace.dependencies]
-local_features = { path = "./local_features/" }
+local-features = { path = "./local-features/" }
 
 criterion = "0.7.0"
 log = "0.4.28"
@@ -13,8 +13,8 @@ itertools = "0.14.0"
 ndarray = "0.16.1"
 nshare = { version = "0.10.0", default-features = false, features = ["image", "ndarray"] }
 
-[profile.dev.package.local_features]
+[profile.dev.package.local-features]
 opt-level = 2
 
 [workspace.metadata.crane]
-name = "local_features"
+name = "local-features"

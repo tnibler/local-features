@@ -14,7 +14,7 @@ test = false
 bench = false
 
 [dependencies]
-local_features = { workspace = true }
+local-features = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true }
