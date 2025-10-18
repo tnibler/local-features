@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         selected_camera_index: selected_device,
         changed_camera_index: None,
         match_image: None,
-        local_features: feats,
+        local_features: Some(feats),
         min_feature_size: 0.0,
         limit_features: 2000,
         resolution: (width, height),
@@ -85,7 +85,7 @@ struct WebcamDemo {
     changed_camera_index: Option<usize>,
 
     match_image: Option<MatchImage>,
-    local_features: LocalFeaturesVulkan,
+    local_features: Option<LocalFeaturesVulkan>,
     min_feature_size: f32,
     limit_features: u32,
     resolution: (u32, u32),
@@ -135,7 +135,10 @@ impl App for WebcamDemo {
         let CameraImage { rgb_egui, gray } = self.camera.next_frame().unwrap();
         let res = (gray.width(), gray.height());
         if res != self.resolution {
-            self.local_features = make_local_features(&self.vulkan, res.0, res.1).unwrap();
+            // Hack because the struct contains a vulkano Resources, of which there can only ever
+            // be one, so we need to drop the previous instance.
+            self.local_features = None;
+            self.local_features = Some(make_local_features(&self.vulkan, res.0, res.1).unwrap());
             self.resolution = res;
             // self.match_image = None;
         }
@@ -146,6 +149,8 @@ impl App for WebcamDemo {
         let extract_start = std::time::Instant::now();
         let feature_result = self
             .local_features
+            .as_mut()
+            .unwrap()
             .detect_top_n(
                 &img_arr.view(),
                 self.limit_features,
