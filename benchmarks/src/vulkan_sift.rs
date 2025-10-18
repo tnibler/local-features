@@ -2,7 +2,7 @@ use std::mem::MaybeUninit;
 
 use anyhow::{Result, ensure};
 
-use crate::vulkan_sift::bindings::{_BITS_STDINT_INTN_H, vksift_Feature};
+use crate::vulkan_sift::bindings::vksift_Feature;
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
@@ -20,6 +20,7 @@ pub struct VulkanSiftConfig {
     pub max_features: u32,
 }
 
+#[allow(unused)]
 pub struct VulkanSift {
     config: VulkanSiftConfig,
     instance_ptr: *mut bindings::vksift_Instance_T,
@@ -41,6 +42,8 @@ pub struct VulkanSiftFeature {
 struct LoadedVulkan;
 
 impl VulkanSift {
+    /// # Safety
+    /// don't use it wrong
     pub unsafe fn new(config: VulkanSiftConfig) -> Result<Self> {
         unsafe {
             ensure!(
@@ -49,9 +52,7 @@ impl VulkanSift {
             );
             let loaded_vulkan = LoadedVulkan;
 
-            unsafe {
-                bindings::vksift_setLogLevel(bindings::vksift_LogLevel_VKSIFT_NO_LOG);
-            }
+            bindings::vksift_setLogLevel(bindings::vksift_LogLevel_VKSIFT_NO_LOG);
             let mut vk_config = bindings::vksift_getDefaultConfig();
             vk_config.sift_buffer_count = 1;
             vk_config.use_hardware_interpolated_blur = true;

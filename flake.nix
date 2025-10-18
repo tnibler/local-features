@@ -200,6 +200,11 @@
               xorg.libXdmcp
               libxkbcommon
               renderdoc
+              opencv4WithoutCuda
+              opencv4WithoutCuda.cxxdev
+              pkg-config
+              python312
+              uv
             ];
 
             buildInputs = [vulkanSift];
@@ -217,6 +222,7 @@
               RENDERDOC_LAYER_PATH = "${pkgs.renderdoc}/share/vulkan/implicit_layer.d/";
 
               LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
+                opencv4WithoutCuda
                 renderdoc
                 shaderc
                 vulkan-loader
