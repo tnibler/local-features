@@ -70,7 +70,6 @@
               shaderc
               llvmPackages.libclang.lib
               vulkan-headers
-              gpp
             ];
 
             VULKAN_SDK = "${targetPkgs.vulkan-headers}";

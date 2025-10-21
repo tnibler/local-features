@@ -1,11 +1,9 @@
-$include["../macros.gpp"]
-// TRIM_ABOVE
 #version 460
 #include "../extensions.glsl"
 #extension GL_EXT_spirv_intrinsics: enable
 #extension GL_EXT_buffer_reference_uvec2 : require
-#include "../common.gpp.glsl"
-#include "swizzle.gpp.glsl"
+#include "../common.glsl"
+#include "swizzle.glsl"
 #include "embedding_common.glsl"
 
 #define EMBEDDING_CARTESIAN
@@ -45,7 +43,7 @@ layout(push_constant) uniform EmbedPc {
 };
 
 vec4 get_embedding_coeff(uint dim, float ppos, bool is_y) {
-    @ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
+    ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
     if (dim == 0) {
         return vec4(FOURIER_COEFFS[0]);
     }

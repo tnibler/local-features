@@ -1,8 +1,6 @@
-$include["macros.gpp"]
-// TRIM_ABOVE
 #version 460
 #include "extensions.glsl"
-#include "common.gpp.glsl"
+#include "common.glsl"
 
 const uint WG_SIZE_X = 16;
 const uint WG_SIZE_Y = 4;
@@ -41,7 +39,7 @@ shared float sh_patch[WG_SIZE_X * BUF_ROWS];
 const float MAX_MAGNITUDE = sqrt(2.0) + 1e-1;
 
 uint pack_fixed_point_16(float w) {
-    @ASSERT(0 <= w && w < MAX_MAGNITUDE; "%f"; w);
+    ASSERT(0 <= w && w < MAX_MAGNITUDE);
     const float f = clamp(w / MAX_MAGNITUDE, 0, 1);
     const uint fp = uint(round(f * float(1 << 16)));
     return fp;
@@ -62,7 +60,7 @@ void main() {
     // The 0th layer in the image pyramid is downsampled by this factor.
     const float base_scale = 1.0;
 
-    const ivec2 texture_size = textureSize(@texture_patch_pyr, 0);
+    const ivec2 texture_size = textureSize(TEXTURE_PATCH_PYR, 0);
     const float kp_x = get_extremum_x_float(extremum_locations, extremum_idx) * base_scale;
     const float kp_y = get_extremum_y_float(extremum_locations, extremum_idx) * base_scale;
     const float kp_size = get_extremum_scale_float(extremum_locations, extremum_idx) * base_scale;
@@ -100,7 +98,7 @@ void main() {
             const float sample_x = (x_img + 0.5) / float(texture_size.x);
             const float sample_y = (y_img + 0.5) / float(texture_size.y);
             my_samples[i] = textureLod(
-                sampler2D(@texture_patch_pyr, @sampler_nn),
+                sampler2D(TEXTURE_PATCH_PYR, SAMPLER_NN),
                 vec2(sample_x, sample_y),
                 layer
             ).r;
@@ -118,7 +116,7 @@ void main() {
         const int need_samples_until = min(window_start + 4, 15);
         const int y_abs = window_start + local_y;
         while (4 * sample_index + local_y <= need_samples_until) {
-            @ASSERT(sample_index < 4);
+            ASSERT(sample_index < 4);
             const uint sample_position = 4 * sample_index + local_y;
             const uint row = (rb_row_idx + sample_position - window_start) % BUF_ROWS;
             sh_patch[row * WG_SIZE_X + local_x] = my_samples[sample_index];
@@ -126,7 +124,7 @@ void main() {
         }
         barrier();
         const int my_row = ((rb_row_idx + local_y) % BUF_ROWS)*int(WG_SIZE_X);
-        @ASSERT(sh_patch[my_row + local_x] == my_samples[y_abs/4]);
+        ASSERT(sh_patch[my_row + local_x] == my_samples[y_abs/4]);
 
         const bool single_diff_x = (local_x == 0) || (local_x == 15);
         const float xl = sh_patch[((rb_row_idx + local_y) % BUF_ROWS) * WG_SIZE_X + max(local_x, 1) - 1];
@@ -149,7 +147,7 @@ void main() {
             const int raw_bin = int(round(angle * BIN_ANGLE_STEP));
             const uint bin = raw_bin < 0 ? raw_bin + N_BINS : (raw_bin >= N_BINS ? raw_bin - N_BINS : raw_bin);
             my_weights[i] = grad_mag * exp(-distance_sq / (2.0 * sigma * sigma));
-            @ASSERT(bin < N_BINS);
+            ASSERT(bin < N_BINS);
             my_bins[i] = bin;
         }
 
@@ -157,11 +155,11 @@ void main() {
         barrier();
     }
 
-    @ASSERT(gl_LocalInvocationIndex < sh_patch.length());
+    ASSERT(gl_LocalInvocationIndex < sh_patch.length());
     sh_patch[gl_LocalInvocationIndex] = uintBitsToFloat(uint(my_bins[0]) | (uint(my_bins[1]) << 8) | (uint(my_bins[2]) << 16) | (uint(my_bins[3]) << 24));
     const uint packed1 = pack_fixed_point_16(my_weights[0]) | (pack_fixed_point_16(my_weights[1]) << 16);
     const uint packed2 = pack_fixed_point_16(my_weights[2]) | (pack_fixed_point_16(my_weights[3]) << 16);
-    @ASSERT(2 * gl_LocalInvocationIndex + 1 < sh_weights.length());
+    ASSERT(2 * gl_LocalInvocationIndex + 1 < sh_weights.length());
     sh_weights[2 * gl_LocalInvocationIndex] = packed1;
     sh_weights[2 * gl_LocalInvocationIndex + 1] = packed2;
 
@@ -259,7 +257,7 @@ void main() {
                 }
                 max_sg = subgroupMax(m);
             }
-            @ASSERT(sample_index > 0);
+            ASSERT(sample_index > 0);
         }
         if (subgroupElect()) {
             const uint first_idx = atomicAdd(keypoints.n_keypoints, n_maxima);

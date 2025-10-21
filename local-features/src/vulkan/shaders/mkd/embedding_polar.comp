@@ -1,10 +1,7 @@
-$include["../macros.gpp"]
-// TRIM_ABOVE
-
 #version 460
 #include "../extensions.glsl"
-#include "../common.gpp.glsl"
-#include "swizzle.gpp.glsl"
+#include "../common.glsl"
+#include "swizzle.glsl"
 #include "embedding_common.glsl"
 
 
@@ -32,7 +29,7 @@ layout(push_constant) uniform EmbedPc {
 
 // group_angle: angle/argument of pixel in top left quadrant
 float get_embedding_coeff_angle(uint dim, float group_angle) {
-    @ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
+    ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
     if (dim == 0) {
         return FOURIER_COEFFS[0];
     }
@@ -59,7 +56,7 @@ vec4 get_embedding_angle_symmetry(uint dim) {
 }
 
 float get_embedding_coeff_magnitude(uint dim, float mmag) {
-    @ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
+    ASSERT(dim < N_COMPONENTS * N_COMPONENTS);
     const float mag = mmag * PI / sqrt(2);
     if (dim == 0) {
         return FOURIER_COEFFS[0];

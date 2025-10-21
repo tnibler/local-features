@@ -1,4 +1,4 @@
-#include "../common.gpp.glsl"
+#include "../common.glsl"
 
 const float VM_FOURIER_N3_K8[] = {
         0.37872374,

@@ -1,9 +1,7 @@
-$include["../macros.gpp"]
-// TRIM_ABOVE
 #version 460
 #include "../extensions.glsl"
-#include "../common.gpp.glsl"
-#include "swizzle.gpp.glsl"
+#include "../common.glsl"
+#include "swizzle.glsl"
 
 layout(local_size_x = 32, local_size_y = 32) in;
 
@@ -48,7 +46,7 @@ void main() {
     const float patch_angle = radians(uintBitsToFloat(keypoints.data[MAX_KEYPOINTS + patch_index]));
 
     {
-        const vec2 texture_size = textureSize(@texture_patch_pyr, 0);
+        const vec2 texture_size = textureSize(TEXTURE_PATCH_PYR, 0);
         const float ps2 = float(PATCH_SIZE) / 2.0;
         const float xx = (float(local_x) - ps2) * cos(patch_angle) - (float(local_y) - ps2) * sin(patch_angle);
         const float yy = (float(local_x) - ps2) * sin(patch_angle) + (float(local_y) - ps2) * cos(patch_angle);
@@ -56,12 +54,12 @@ void main() {
         const float sample_y = yy + patch_y;
         if (kp_scale_level == 0) {
             sh_patch[local_y * PATCH_SIZE + local_x] = texture(
-                sampler2DArray(texture_coarse, @sampler_bil),
+                sampler2DArray(texture_coarse, SAMPLER_BIL),
                 vec3((sample_x + 0.5) / texture_size.x, (sample_y + 0.5) / texture_size.y, 0)
             ).r;
         } else {
             sh_patch[local_y * PATCH_SIZE + local_x] = textureLod(
-                sampler2D(@texture_patch_pyr, @sampler_bil),
+                sampler2D(TEXTURE_PATCH_PYR, SAMPLER_BIL),
                 vec2(sample_x + 0.5, sample_y + 0.5)/ texture_size,
                 // No real justification for the -1 here. Seems to work quite well,
                 // but no comprehensive testing. 
@@ -107,7 +105,7 @@ void main() {
     const float angle = -atan(grad_y, grad_x);
 
     const uint out_index = swizzled_index(local_x, local_y);
-    @ASSERT(unswizzle_index(out_index) == uvec2(local_x, local_y));
+    ASSERT(unswizzle_index(out_index) == uvec2(local_x, local_y));
     patch_gradients.patches[patch_index].data[out_index] = mag;
     patch_gradients.patches[MAX_KEYPOINTS + patch_index].data[out_index] = angle;
 }

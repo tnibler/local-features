@@ -1,8 +1,6 @@
-$include["macros.gpp"]
-// TRIM_ABOVE
 #version 460
 #include "extensions.glsl"
-#include "common.gpp.glsl"
+#include "common.glsl"
 #include "conv_pushconstants.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -10,11 +8,11 @@ layout(local_size_x = 8, local_size_y = 8) in;
 const float KERNEL[] = { 6.0/16.0, 4.0/16.0, 1.0/16.0 };
 
 float sampleCoarse(vec2 coords) {
-    return texture(sampler2DArray(texture_coarse, @sampler_bil), vec3(coords.x, coords.y, in_level)).r;
+    return texture(sampler2DArray(texture_coarse, SAMPLER_BIL), vec3(coords.x, coords.y, in_level)).r;
 }
 
 float sampleScratch(vec2 coords) {
-    return texture(sampler2D(@texture_scratch, @sampler_bil), coords).r;
+    return texture(sampler2D(TEXTURE_SCRATCH, SAMPLER_BIL), coords).r;
 }
 
 void main() {
@@ -52,7 +50,7 @@ void main() {
         sum += sampleCoarse(coords_in + vec2(dilate * 1, 0)).r * KERNEL[1];
         sum += sampleCoarse(coords_in + vec2(dilate * 2, 0)).r * KERNEL[2];
 
-        imageStore(@image_scratch, ivec2(x, y), vec4_FORMAT(sum, 0.0, 0.0, 1.0));
+        imageStore(IMAGE_SCRATCH, ivec2(x, y), vec4_FORMAT(sum, 0.0, 0.0, 1.0));
     }
 }
 

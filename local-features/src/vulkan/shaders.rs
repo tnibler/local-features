@@ -24,63 +24,63 @@ pub mod shaders_f32 {
         define: [("PRECISION_FLOAT32", "1")],
         shaders: {
             blur: {
-                path: "src/vulkan/shaders_build/blur.gpp.comp",
+                path: "src/vulkan/shaders/blur.comp",
                 ty: "compute",
             },
             swt_dense: {
-                path: "src/vulkan/shaders_build/blur.gpp.comp",
+                path: "src/vulkan/shaders/blur.comp",
                 ty: "compute",
                 define: [("BINOMIAL_FILTER", "1")],
             },
             swt_sparse1: {
-                path: "src/vulkan/shaders_build/swt_sparse1.gpp.comp",
+                path: "src/vulkan/shaders/swt_sparse1.comp",
                 ty: "compute",
             },
             swt_sparse2: {
-                path: "src/vulkan/shaders_build/swt_sparse.gpp.comp",
+                path: "src/vulkan/shaders/swt_sparse.comp",
                 ty: "compute",
             },
             swt: {
-                path: "src/vulkan/shaders_build/swt.gpp.comp",
+                path: "src/vulkan/shaders/swt.comp",
                 ty: "compute",
             },
             scan_extrema: {
                 ty: "compute",
-                path: "src/vulkan/shaders_build/scan_extrema.gpp.comp",
+                path: "src/vulkan/shaders/scan_extrema.comp",
             },
             blur_pyramid: {
                 ty: "compute",
-                path: "src/vulkan/shaders_build/blur_pyramid.gpp.comp",
+                path: "src/vulkan/shaders/blur_pyramid.comp",
             },
             keypoint_orientation: {
-                path: "src/vulkan/shaders_build/keypoint_orientation.gpp.comp",
+                path: "src/vulkan/shaders/keypoint_orientation.comp",
                 ty: "compute",
             },
             patch_gradients: {
                 ty: "compute",
-                path: "src/vulkan/shaders_build/mkd/patch_gradients.gpp.comp",
+                path: "src/vulkan/shaders/mkd/patch_gradients.comp",
             },
             embedding_polar: {
                 ty: "compute",
-                path: "src/vulkan/shaders_build/mkd/embedding_polar.gpp.comp",
+                path: "src/vulkan/shaders/mkd/embedding_polar.comp",
                 // bytes: "embedding_polar.spv",
             },
             embedding_cartesian: {
                 ty: "compute",
-                path: "src/vulkan/shaders_build/mkd/embedding_cartesian.gpp.comp",
+                path: "src/vulkan/shaders/mkd/embedding_cartesian.comp",
                 // bytes: "embedding_cartesian.spv",
             },
             normalize: {
                 ty: "compute",
-                path: "src/vulkan/shaders_build/mkd/normalize.comp",
+                path: "src/vulkan/shaders/mkd/normalize.comp",
             },
             whitening: {
                 ty: "compute",
-                path: "src/vulkan/shaders_build/mkd/whitening.comp",
+                path: "src/vulkan/shaders/mkd/whitening.comp",
             },
             normalize_final: {
                 ty: "compute",
-                path: "src/vulkan/shaders_build/mkd/normalize_final.comp",
+                path: "src/vulkan/shaders/mkd/normalize_final.comp",
             },
         },
     }

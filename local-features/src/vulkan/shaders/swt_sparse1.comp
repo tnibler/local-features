@@ -1,9 +1,7 @@
-$include["macros.gpp"]
-// TRIM_ABOVE
 #version 460
 #include "extensions.glsl"
 #include "pixel_type.glsl"
-#include "common.gpp.glsl"
+#include "common.glsl"
 #include "conv_pushconstants.glsl"
 
 // Separable convolution with kernel of size 5, dilated with 1 zero between each element.
@@ -26,7 +24,7 @@ shared float sh_samples[2 * QUAD_ROWS][2 * QUAD_ROW_WIDTH];
 const float KERNEL[] = { 1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.0 };
 
 void main() {
-    const vec2 texture_size = textureSize(@texture_scratch, 0);
+    const vec2 texture_size = textureSize(TEXTURE_SCRATCH, 0);
 
     const int wg_long = int(gl_WorkGroupID.x) * WG_SIZE_X;
     const int wg_short = int(gl_WorkGroupID.y) * WG_SIZE_Y * 2;
@@ -47,7 +45,7 @@ void main() {
                     float(wg_long + 1 + load_loc) / texture_size.y
                 );
                 // bl br tr tl
-                const vec4 samp = textureGather(sampler2D(@texture_scratch, @sampler_bil), coords);
+                const vec4 samp = textureGather(sampler2D(TEXTURE_SCRATCH, SAMPLER_BIL), coords);
 
                 // left column
                 sh_samples[2 * quad_row][2 * load_quad] = samp.w;
@@ -69,7 +67,7 @@ void main() {
                     float(wg_short + 2 * quad_row + 1) / texture_size.y,
                     in_level
                 );
-                const vec4 samp = textureGather(sampler2DArray(texture_coarse, @sampler_bil), coords);
+                const vec4 samp = textureGather(sampler2DArray(texture_coarse, SAMPLER_BIL), coords);
 
                 // top row
                 sh_samples[2 * quad_row][2 * load_quad] = samp.w;
@@ -127,7 +125,7 @@ void main() {
                 if (vertical_pass) {
                     imageStore(image_coarse, write_loc, vec4_FORMAT(my_result, 0.0, 0.0, 1.0));
                 } else {
-                    imageStore(@image_scratch, write_loc.xy, vec4_FORMAT(my_result, 0.0, 0.0, 1.0));
+                    imageStore(IMAGE_SCRATCH, write_loc.xy, vec4_FORMAT(my_result, 0.0, 0.0, 1.0));
                 }
             }
         }

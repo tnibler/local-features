@@ -1,8 +1,6 @@
-$include["macros.gpp"]
-// TRIM_ABOVE
 #version 460
 #include "extensions.glsl"
-#include "common.gpp.glsl"
+#include "common.glsl"
 #include "conv_pushconstants.glsl"
 
 // A trous SWT kernel, for levels with >=2 zeros inbetween each kernel element
@@ -34,7 +32,7 @@ void main() {
     if (vertical_pass) {
         for (int i = 0; i < KERNEL.length(); i++) {
             const vec2 loc = vec2(float(x + 1), float(y + (i - 2) * dilate + 1)) / texture_size;
-            const vec4 samp = textureGather(sampler2D(@texture_scratch, @sampler_bil), loc);
+            const vec4 samp = textureGather(sampler2D(TEXTURE_SCRATCH, SAMPLER_BIL), loc);
             sum += KERNEL[i] * samp;
         }
         imageStore(image_coarse, ivec3(x, y, in_level + 1), vec4(sum[3], 0, 0, 1));
@@ -50,18 +48,18 @@ void main() {
     } else {
         for (int i = 0; i < KERNEL.length(); i++) {
             const vec3 loc = vec3(float(x + (i - 2) * dilate + 1) / texture_size.x, float(y + 1) / texture_size.y, in_level);
-            const vec4 samp = textureGather(sampler2DArray(texture_coarse, @sampler_bil), loc);
+            const vec4 samp = textureGather(sampler2DArray(texture_coarse, SAMPLER_BIL), loc);
             sum += KERNEL[i] * samp;
         }
-        imageStore(@image_scratch, ivec2(x, y), vec4(sum[3], 0, 0, 1));
+        imageStore(IMAGE_SCRATCH, ivec2(x, y), vec4(sum[3], 0, 0, 1));
         if (x < width - 1) {
-            imageStore(@image_scratch, ivec2(x + 1, y), vec4(sum[2], 0, 0, 1));
+            imageStore(IMAGE_SCRATCH, ivec2(x + 1, y), vec4(sum[2], 0, 0, 1));
         }
         if (y < height - 1) {
-            imageStore(@image_scratch, ivec2(x, y + 1), vec4(sum[0], 0, 0, 1));
+            imageStore(IMAGE_SCRATCH, ivec2(x, y + 1), vec4(sum[0], 0, 0, 1));
         }
         if (x < width - 1 && y < height - 1) {
-            imageStore(@image_scratch, ivec2(x + 1, y + 1), vec4(sum[1], 0, 0, 1));
+            imageStore(IMAGE_SCRATCH, ivec2(x + 1, y + 1), vec4(sum[1], 0, 0, 1));
         }
     }
 }

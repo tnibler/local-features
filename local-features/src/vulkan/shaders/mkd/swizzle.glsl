@@ -1,5 +1,3 @@
-$include["../macros.gpp"]
-// TRIM_ABOVE
 #ifndef _SWIZZLE_GLSL
 #define _SWIZZLE_GLSL
 

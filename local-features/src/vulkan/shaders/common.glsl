@@ -1,28 +1,17 @@
-$include["macros.gpp"]
-// TRIM_ABOVE
 #ifndef _COMMON_GLSL
 #define _COMMON_GLSL
 
 #include "extensions.glsl"
 #include "pixel_type.glsl"
+#include "bindings.glsl"
+
+#ifdef ENABLE_ASSERTIONS
+#define ASSERT(expr) ( expr || (printf("Assertion failed: %s:%d\n", __FILE__, __LINE__), false) )
+#else 
+#define ASSERT(expr) 
+#endif
 
 const float PI = 3.1415926538;
-
-layout (constant_id = 0) const uint MIN_SUBGROUP_SIZE = 8;
-layout (constant_id = 1) const uint MAX_EXTREMA = 1;
-layout (constant_id = 2) const uint MAX_KEYPOINTS = 1;
-layout (constant_id = 3) const uint EXTREMUM_BLOCK_LEN = 256;
-layout (constant_id = 4) const uint PATCH_PYRAMID_LEVELS = 5;
-#define NUM_GLOBAL_CONSTANTS 5
-
-layout(binding = 0, r32f) uniform image2DArray image_coarse; 
-layout(binding = 1) uniform texture2DArray texture_coarse; 
-// One image view for each pyramid mip level
-layout(binding = 2, r32f) uniform image2D images[2 + PATCH_PYRAMID_LEVELS]; 
-layout(binding = 3) uniform texture2D textures[3]; 
-layout(binding = 4) uniform sampler samplers[2]; 
-// layout(binding = 5) uniform {
-// } buffers;
 
 // detected blob radius = sqrt(2) * sigma_LoG = sqrt(2) * ratio * sigma_DoG * sqrt(log(ratio) / (ratio^2 - 1)) $, where ratio = 2, sigma_DoG = 0.6 (first blur, before SWT)
 // = 0.8157, but 0.82 works a bit better with all other constants in e.g., keypoint_orientation

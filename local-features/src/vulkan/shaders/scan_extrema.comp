@@ -1,9 +1,7 @@
-$include["macros.gpp"]
-// TRIM_ABOVE
 #version 460
 #include "extensions.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types : enable
-#include "common.gpp.glsl"
+#include "common.glsl"
 
 layout(constant_id = NUM_GLOBAL_CONSTANTS) const uint LAYERS_PER_WG = 5;
 // Square of this many quads is covered by one workgroup
@@ -52,27 +50,25 @@ shared float sh_extremum_contrast[max_wg_extrema];
 ivec3 wg_coords = (ivec3(gl_WorkGroupID) * ivec3(SCAN_AREA, SCAN_AREA, 1) 
     + ivec3(border, border, skip_layers));
 
-$define[@DBG(arg); if (gl_WorkGroupID == uvec3(11, 11, 0) && gl_LocalInvocationIndex == 11) { printf(@arg); }]
-
 vec4 load_quad(ivec3 v) {
     const vec3 coords = vec3(
         float(v.x) / width,
         float(v.y) / height,
         float(v.z)
     );
-    return textureGather(sampler2DArray(texture_coarse, @sampler_bil), coords);
+    return textureGather(sampler2DArray(texture_coarse, SAMPLER_BIL), coords);
 }
 
 
 // z is offset to largest scale in ringbuf layer that has one before and one after, so the last index - 1
 float at(int z, int y, int x) {
-    @ASSERT(-1 <= y && y < int(BUFFER_SIZE-1); "x=%d   y=%d"; x, y);
-    @ASSERT(-1 <= x && x < int(BUFFER_SIZE-1); "x=%d   y=%d"; x, y);
+    ASSERT(-1 <= y && y < int(BUFFER_SIZE-1));
+    ASSERT(-1 <= x && x < int(BUFFER_SIZE-1));
     const uint layer = uint(int(rb_center_layer) + int(RINGBUF_LAYERS) + z) % RINGBUF_LAYERS;
 
     // +2 because we're wasting one perimeter of pixels right now
     const uint idx = (y + 1) * BUFFER_SIZE + x + 1;
-    @ASSERT(0 <= idx && idx < BUFFER_SIZE * BUFFER_SIZE; "%d"; idx);
+    ASSERT(0 <= idx && idx < BUFFER_SIZE * BUFFER_SIZE);
 
     return sh_dog_ringbuf[layer][idx];
 }
