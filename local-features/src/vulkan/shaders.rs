@@ -321,6 +321,8 @@ impl ExtremumLocationsBufferLayout {
         (n_extrema as usize).div_ceil(self.block_len) * self.block_len * N_COORDS
     }
 
+    /// Transforms a slice over extremum coordinates (starting at offset_coords!) in struct-of-array with blocks layout
+    /// into views of corresponding coordinate slices.
     pub fn coords_ranges<'a>(
         &self,
         buffer: &'a [f32],

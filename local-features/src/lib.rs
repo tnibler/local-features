@@ -81,7 +81,7 @@ impl Default for BuildTimeParams {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FeaturesResult {
     pub keypoints: Vec<Keypoint>,
     pub descriptors: Array2<f32>,

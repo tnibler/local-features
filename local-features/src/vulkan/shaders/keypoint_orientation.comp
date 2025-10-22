@@ -16,7 +16,11 @@ layout(push_constant) uniform KeypointOrientationPc {
 
     uint width;
     uint height;
+    uint rt_max_extrema;
     uint rt_max_keypoints;
+    // false: use workgropup id to index into extremum locations
+    // true: use workgroup id as index into filtered_extrema, which then indexes into extremum locations 
+    bool use_filtered_extremum_index;
 };
 
 // This implementation is not particularly clever, but it works and is mostly waiting for image samples anyway.
@@ -51,8 +55,16 @@ float unpack_fixed_point_16(uint packed) {
 
 
 void main() {
-    // number of workgroups = number of filtered extrema, so WorkGroupID.x is a valid index
-    const uint extremum_idx = filtered_extrema.indices[gl_WorkGroupID.x];
+    uint extremum_idx;
+    if (use_filtered_extremum_index) {
+        // number of workgroups = number of filtered extrema, so WorkGroupID.x is a valid index
+        extremum_idx = filtered_extrema.indices[gl_WorkGroupID.x];
+    } else {
+        extremum_idx = gl_WorkGroupID.x;
+        if (extremum_idx >= min(rt_max_extrema, extremum_locations.n_extrema)) {
+            return;
+        }
+    }
 
     const int local_x = int(gl_LocalInvocationID.x);
     const int local_y = int(gl_LocalInvocationID.y);

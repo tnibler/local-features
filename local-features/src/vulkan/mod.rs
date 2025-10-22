@@ -24,7 +24,7 @@ use vulkano::{
 use vulkano_taskgraph::{
     Id, QueueFamilyType, TaskContext,
     command_buffer::{BufferMemoryBarrier, CopyBufferInfo, DependencyInfo, RecordingCommandBuffer},
-    graph::{CompileInfo, ExecutableTaskGraph, ResourceMap, TaskGraph},
+    graph::{CompileInfo, ExecutableTaskGraph, NodeId, ResourceMap, TaskGraph},
     resource::{AccessTypes, Flight, HostAccessType, ImageLayoutType, Resources, ResourcesCreateInfo},
     resource_map,
 };
@@ -88,8 +88,9 @@ pub struct LocalFeaturesVulkan {
     vk: Vulkan,
     resources: Arc<Resources>,
     physical_resources: PhysicalResources,
-    detect: Detect,
-    extract: Extract,
+    detect_standalone: CompiledTaskGraph,
+    extract_standalone: CompiledTaskGraph,
+    detect_extract_all: CompiledTaskGraph,
     flight_id: Id<Flight>,
 
     // not fully sorted out, if ever multiple flights are allowed each flight needs these
@@ -140,12 +141,7 @@ struct BufferLayouts {
     keypoints: shaders::KeypointsBufferLayout,
 }
 
-struct Detect {
-    taskgraph: ExecutableTaskGraph<GlobalContext>,
-    virtual_ids: BufferIds,
-}
-
-struct Extract {
+struct CompiledTaskGraph {
     taskgraph: ExecutableTaskGraph<GlobalContext>,
     virtual_ids: BufferIds,
 }
@@ -156,7 +152,8 @@ struct BufferIds {
     buf_constants: Id<Buffer>,
     /// Staging buffer: always used to store input image data before it's copied to a VkImage,
     /// optionally used for staging other inputs and results as well.
-    buf_staging: Id<Buffer>,
+    buf_staging_write: Id<Buffer>,
+    buf_staging_read: Id<Buffer>,
     buf_extremum_locations: Id<Buffer>,
     buf_filtered_extrema: Id<Buffer>,
     buf_keypoints: Id<Buffer>,
@@ -274,8 +271,126 @@ impl LocalFeaturesVulkan {
         let pipelines = shaders::create_pipelines(&fixed_params, &vk)?;
         let physical_resources = allocate_buffers(&resources, &vk, &pipelines, &fixed_params, &buffer_layouts)?;
         let flight_id = resources.create_flight(1)?;
-        let detect = build_detect_taskgraph(&resources, flight_id, &fixed_params, &buffer_layouts, &pipelines, &vk)?;
-        let extract = build_extract_taskgraph(&resources, flight_id, &fixed_params, &buffer_layouts, &pipelines, &vk)?;
+
+        let detect_standalone = {
+            let mut tg = TaskGraph::new(&resources);
+            let virtual_ids = make_virtual_ids(&mut tg);
+
+            let last_detect_node =
+                build_detect_taskgraph(&mut tg, &virtual_ids, &fixed_params, &buffer_layouts, &pipelines)?;
+
+            if fixed_params.use_staging_buffers == StagingBuffers::Yes {
+                let copy_size = buffer_layouts.extremum_locations.size_total;
+                let copy_node_id = tg
+                    .create_task_node(
+                        "copy keypoints to staging",
+                        QueueFamilyType::Transfer,
+                        tasks_common::CopyBufferTask {
+                            src: virtual_ids.buf_extremum_locations,
+                            dst: virtual_ids.buf_staging_read,
+                            size: copy_size,
+                            src_offset: 0,
+                        },
+                    )
+                    .buffer_access(virtual_ids.buf_staging_read, AccessTypes::COPY_TRANSFER_WRITE)
+                    .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COPY_TRANSFER_READ)
+                    .build();
+                tg.add_edge(last_detect_node, copy_node_id).unwrap();
+            }
+
+            let tg = unsafe {
+                tg.compile(&CompileInfo { queues: &[&vk.queue], present_queue: None, flight_id, ..Default::default() })
+                    .expect("TODO")
+            };
+            CompiledTaskGraph { taskgraph: tg, virtual_ids }
+        };
+
+        let extract_standalone = {
+            let mut tg = TaskGraph::new(&resources);
+            let virtual_ids = make_virtual_ids(&mut tg);
+
+            let chain_extract = if fixed_params.use_staging_buffers == StagingBuffers::Yes {
+                // Copy in host filtered extremum indices from staging
+                let copy_node_id = tg
+                    .create_task_node(
+                        "copy from staging",
+                        QueueFamilyType::Transfer,
+                        tasks_common::CopyBufferTask {
+                            src: virtual_ids.buf_staging_write,
+                            dst: virtual_ids.buf_filtered_extrema,
+                            // copying more than necessary, could use n_filtered_extrema instead
+                            size: buffer_layouts.filtered_extrema.size_total,
+                            src_offset: 0,
+                        },
+                    )
+                    .buffer_access(virtual_ids.buf_staging_write, AccessTypes::COPY_TRANSFER_READ)
+                    .buffer_access(virtual_ids.buf_filtered_extrema, AccessTypes::COPY_TRANSFER_WRITE)
+                    .build();
+                ChainExtractTg::ConnectTo { connect_node: copy_node_id, use_host_filtered_extremum_indices: true }
+            } else {
+                ChainExtractTg::Standalone
+            };
+
+            let last_node = build_extract_taskgraph(&mut tg, chain_extract, &virtual_ids, &fixed_params, &pipelines)?;
+
+            if fixed_params.use_staging_buffers == StagingBuffers::Yes {
+                let copy_node_id = tg
+                    .create_task_node(
+                        "copy keypoints+descriptors to staging",
+                        QueueFamilyType::Transfer,
+                        tasks_extract::DescriptorAndKeypointCopyTask {
+                            buffers: virtual_ids.clone(),
+                            read_extremum_locations: false,
+                        },
+                    )
+                    .buffer_access(virtual_ids.buf_staging_read, AccessTypes::COPY_TRANSFER_WRITE)
+                    .buffer_access(virtual_ids.buf_embeddings_or_descriptors, AccessTypes::COPY_TRANSFER_READ)
+                    .buffer_access(virtual_ids.buf_keypoints, AccessTypes::COPY_TRANSFER_READ)
+                    .build();
+                tg.add_edge(last_node, copy_node_id).unwrap();
+            }
+            let tg = unsafe {
+                tg.compile(&CompileInfo { queues: &[&vk.queue], present_queue: None, flight_id, ..Default::default() })
+                    .expect("TODO")
+            };
+            CompiledTaskGraph { taskgraph: tg, virtual_ids }
+        };
+
+        let detect_extract_all = {
+            let mut tg = TaskGraph::new(&resources);
+            let virtual_ids = make_virtual_ids(&mut tg);
+
+            let last_detect_node =
+                build_detect_taskgraph(&mut tg, &virtual_ids, &fixed_params, &buffer_layouts, &pipelines)?;
+
+            let chain_extract =
+                ChainExtractTg::ConnectTo { connect_node: last_detect_node, use_host_filtered_extremum_indices: false };
+            let last_node = build_extract_taskgraph(&mut tg, chain_extract, &virtual_ids, &fixed_params, &pipelines)?;
+
+            if fixed_params.use_staging_buffers == StagingBuffers::Yes {
+                let copy_node_id = tg
+                    .create_task_node(
+                        "copy keypoints+descriptors to staging",
+                        QueueFamilyType::Transfer,
+                        tasks_extract::DescriptorAndKeypointCopyTask {
+                            buffers: virtual_ids.clone(),
+                            read_extremum_locations: true,
+                        },
+                    )
+                    .buffer_access(virtual_ids.buf_staging_read, AccessTypes::COPY_TRANSFER_WRITE)
+                    .buffer_access(virtual_ids.buf_embeddings_or_descriptors, AccessTypes::COPY_TRANSFER_READ)
+                    .buffer_access(virtual_ids.buf_keypoints, AccessTypes::COPY_TRANSFER_READ)
+                    .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COPY_TRANSFER_READ)
+                    .build();
+                tg.add_edge(last_node, copy_node_id).unwrap();
+            }
+
+            let tg = unsafe {
+                tg.compile(&CompileInfo { queues: &[&vk.queue], present_queue: None, flight_id, ..Default::default() })
+                    .expect("TODO")
+            };
+            CompiledTaskGraph { taskgraph: tg, virtual_ids }
+        };
 
         upload_constant_data(&fixed_params, &physical_resources, &vk.queue, &resources, flight_id)?;
 
@@ -285,8 +400,9 @@ impl LocalFeaturesVulkan {
             tweak_params,
             fixed_params,
             buffer_layouts,
-            detect,
-            extract,
+            detect_standalone,
+            extract_standalone,
+            detect_extract_all,
             physical_resources,
             flight_id,
             candidate_blobs_readback: IndexVec::new(),
@@ -299,8 +415,128 @@ impl LocalFeaturesVulkan {
         img: &ArrayView2<f32>,
         params: &FeatureDetectParams,
     ) -> Result<FeaturesResult, crate::vulkan::VulkanError> {
-        // TODO: pointless CPU detour here if no filtering as actually done.
-        self.detect(img, params, None)
+        let resource_map = resource_map(
+            &self.detect_extract_all.taskgraph,
+            &self.detect_extract_all.virtual_ids,
+            &self.physical_resources.ids,
+        );
+        let mut global_context = self.make_global_context(img, params);
+        global_context.n_filtered_extrema = global_context.rt_max_extrema;
+        unsafe {
+            self.detect_extract_all.taskgraph.execute(resource_map, &global_context, || {}).unwrap();
+        }
+        self.resources.flight(self.detect_extract_all.taskgraph.flight_id()).unwrap().wait(None)?;
+
+        let mut keypoints: Vec<Keypoint> = Vec::new();
+        let mut descriptors_flat: Vec<f32> = Vec::new();
+        let mut dropped_features: u32 = 0;
+        let mut dropped_extrema: u32 = 0;
+        let readback_host_buffer_accesses: &[_] = match self.fixed_params.use_staging_buffers {
+            StagingBuffers::Yes => &[(self.physical_resources.ids.buf_staging_read, HostAccessType::Read)],
+            StagingBuffers::No => todo!(),
+        };
+        unsafe {
+            vulkano_taskgraph::execute(
+                &self.vk.queue,
+                &self.resources,
+                self.flight_id,
+                |_cbf: &mut RecordingCommandBuffer<'_>, tcx: &mut TaskContext<'_>| {
+                    let keypoints_layout = &self.buffer_layouts.keypoints;
+                    let copy_keypoints_size = keypoints_layout.size_total;
+                    let copy_descriptors_size =
+                        u64::from(self.fixed_params.max_keypoints) * DESCRIPTOR_LEN as u64 * size_of::<f32>() as u64;
+                    let copy_extremum_locations_size = self.buffer_layouts.extremum_locations.size_total;
+                    let descriptors_offset = copy_keypoints_size;
+                    let copy_size = copy_keypoints_size + copy_descriptors_size + copy_extremum_locations_size;
+
+                    let buf: &[u32] = tcx.read_buffer(self.physical_resources.ids.buf_staging_read, ..copy_size)?;
+                    let extremum_locations_offset = copy_descriptors_size + copy_keypoints_size;
+                    let (buf_keypoints_descriptors, buf_extremum_locations) =
+                        buf.split_at(extremum_locations_offset as usize / size_of::<u32>());
+                    let (buf_keypoints, buf_descriptors) =
+                        buf_keypoints_descriptors.split_at(descriptors_offset as usize / size_of::<u32>());
+
+                    let n_scanned_extrema = buf_extremum_locations[0];
+                    let n_extrema = n_scanned_extrema.min(global_context.rt_max_extrema);
+                    dropped_extrema = n_scanned_extrema.saturating_sub(global_context.rt_max_extrema);
+                    // be sure to chop off the n_extrema field before the coordinates
+                    let buf_extremum_locations: &[f32] = bytemuck::cast_slice(
+                        &buf_extremum_locations
+                            [self.buffer_layouts.extremum_locations.offset_coords / size_of::<u32>()..],
+                    );
+
+                    if cfg!(debug_assertions) {
+                        let mut istart = 0;
+                        for view in self
+                            .buffer_layouts
+                            .extremum_locations
+                            .coords_ranges(buf_extremum_locations, n_extrema)
+                            .into_iter()
+                        {
+                            for ((i, x), y, scale, contrast) in
+                                itertools::izip!(view.xs.iter().enumerate(), view.ys, view.scales, view.contrasts)
+                            {
+                                assert_eq!(
+                                    CandidateBlob {
+                                        x: *x,
+                                        y: *y,
+                                        size: *scale,
+                                        contrast: *contrast,
+                                        extremum_index: (istart + i).into()
+                                    },
+                                    self.buffer_layouts
+                                        .extremum_locations
+                                        .get(buf_extremum_locations, (i + istart).into())
+                                );
+                            }
+                            istart += view.xs.len();
+                        }
+                    }
+
+                    let n_total_keypoints = buf_keypoints[keypoints_layout.offset_n_keypoints / size_of::<u32>()];
+                    let n_keypoints = n_total_keypoints.min(global_context.rt_max_keypoints) as usize;
+                    dropped_features = n_total_keypoints.saturating_sub(global_context.rt_max_keypoints);
+                    debug!(
+                        "Keypoints readback: {}, ({} total, {} dropped)",
+                        n_keypoints, n_total_keypoints, dropped_features
+                    );
+
+                    let start_orientations = keypoints_layout.offset_keypoint_orientations / size_of::<u32>();
+                    let orientations = bytemuck::cast_slice::<_, f32>(&buf_keypoints[start_orientations..]);
+                    let location_indices =
+                        &buf_keypoints[keypoints_layout.offset_extremum_indices / size_of::<u32>()..start_orientations];
+                    let read_keypoints = location_indices[..n_keypoints]
+                        .iter()
+                        .map(|idx| GpuExtremumIdx::from_raw(*idx))
+                        .zip(&orientations[..n_keypoints])
+                        .map(|(gpu_idx, orientation)| {
+                            let blob = self.buffer_layouts.extremum_locations.get(buf_extremum_locations, gpu_idx);
+                            Keypoint {
+                                x: blob.x,
+                                y: blob.y,
+                                size: blob.size,
+                                angle: *orientation,
+                                response: blob.contrast,
+                            }
+                        });
+                    keypoints.extend(read_keypoints);
+
+                    let buf_descriptors = bytemuck::cast_slice(&buf_descriptors[..(n_keypoints * DESCRIPTOR_LEN)]);
+                    descriptors_flat.extend(buf_descriptors);
+
+                    Ok(())
+                },
+                readback_host_buffer_accesses.iter().copied(),
+                [],
+                [],
+            )
+            .expect("TODO");
+        }
+        self.resources.flight(self.flight_id).unwrap().wait(None)?;
+        assert_eq!(descriptors_flat.len() % 128, 0);
+        let descriptors =
+            Array2::from_shape_vec((keypoints.len(), DESCRIPTOR_LEN), descriptors_flat).expect("shape is correct");
+        Ok(FeaturesResult { keypoints, descriptors, dropped_blobs: dropped_extrema, dropped_features })
     }
 
     pub fn detect_top_n(
@@ -320,76 +556,39 @@ impl LocalFeaturesVulkan {
         filter_keypoints: Option<&mut dyn FilterBlobs>,
     ) -> Result<FeaturesResult, crate::vulkan::VulkanError> {
         assert!(img.as_slice().is_some());
-        let width: u32 = img.ncols().try_into().expect("TODO");
-        let height: u32 = img.nrows().try_into().expect("TODO");
 
-        let rt_patch_pyr_levels = f32::min(width as f32, height as f32).log2().ceil().round() as u32;
-        let rt_max_extrema = self.fixed_params.max_extrema;
-        let rt_max_keypoints = self.fixed_params.max_keypoints;
         self.candidate_blobs_readback.clear();
         self.extremum_idxs.clear();
-        let detect_resource_map =
-            resource_map(&self.detect.taskgraph, &self.detect.virtual_ids, &self.physical_resources.ids);
+        let detect_resource_map = resource_map(
+            &self.detect_standalone.taskgraph,
+            &self.detect_standalone.virtual_ids,
+            &self.physical_resources.ids,
+        );
 
-        let img_bytes = match self.fixed_params.precision {
-            Precision::Float32 => unsafe { std::slice::from_raw_parts(img.as_ptr() as *const _, img.len()) },
-            Precision::Float16 => {
-                todo!()
-            }
-        };
-
-        // let mut rd = renderdoc::RenderDoc::<renderdoc::V140>::new().unwrap();
-        // rd.start_frame_capture(null(), null());
-
-        let mut global_context = GlobalContext {
-            buffer_layouts: self.buffer_layouts.clone(),
-            fixed_params: self.fixed_params.clone(),
-            image_height: height,
-            image_width: width,
-            padded_width: width,
-            extremum_min_scale: params.min_keypoint_scale,
-            // TODO: start layer based on minimum feature size
-            extremum_skip_layers: 0,
-            contrast_threshold: params.extremum_min_response,
-            // reference to img is valid during this entire function, and the pointer created here
-            // is only ever read while a flight is executing, which we all wait on in this function
-            input_image: img_bytes,
-            physical_resources: self.physical_resources.clone(),
-            // TODO: check if extremum scan works with border
-            border: 0,
-            rt_max_extrema,
-            rt_max_keypoints,
-            rt_patch_pyr_levels,
-            patch_scale_factor: self.tweak_params.patch_scale_factor,
-
-            // set after blob filtering
-            n_filtered_extrema: 0,
-
-            // unused right now
-            edgeness_cm_low: params.edgeness_cm_low,
-            edgeness_cm_high: params.edgeness_cm_high,
-            fix_scale: false,
-        };
+        let mut global_context = self.make_global_context(img, params);
 
         unsafe {
-            self.detect.taskgraph.execute(detect_resource_map, &global_context, || {}).unwrap();
+            self.detect_standalone.taskgraph.execute(detect_resource_map, &global_context, || {}).unwrap();
         }
-        self.resources.flight(self.detect.taskgraph.flight_id()).unwrap().wait(None)?;
+        self.resources.flight(self.detect_standalone.taskgraph.flight_id()).unwrap().wait(None)?;
 
         let start = std::time::Instant::now();
         let dropped_extrema: u32 = self.do_extremum_readback(&mut global_context, filter_keypoints)?;
         debug!("Extrema readback took {:?}", start.elapsed());
 
-        let extract_resource_map =
-            resource_map(&self.extract.taskgraph, &self.extract.virtual_ids, &self.physical_resources.ids);
+        let extract_resource_map = resource_map(
+            &self.extract_standalone.taskgraph,
+            &self.extract_standalone.virtual_ids,
+            &self.physical_resources.ids,
+        );
 
         trace!("Execute extract taskgraph");
 
         unsafe {
-            self.extract.taskgraph.execute(extract_resource_map, &global_context, || {}).unwrap();
+            self.extract_standalone.taskgraph.execute(extract_resource_map, &global_context, || {}).unwrap();
         }
         trace!("Wait on extract flight");
-        self.resources.flight(self.extract.taskgraph.flight_id()).unwrap().wait(None)?;
+        self.resources.flight(self.extract_standalone.taskgraph.flight_id()).unwrap().wait(None)?;
         trace!("Waited on extract flight");
 
         let mut keypoints: Vec<Keypoint> = Vec::new();
@@ -397,7 +596,7 @@ impl LocalFeaturesVulkan {
         let mut dropped_features: u32 = 0;
         if self.fixed_params.use_staging_buffers == StagingBuffers::Yes {
             // Keypoints and descriptors have already been copied to staging
-            let readback_host_buffer_accesses = [(self.physical_resources.ids.buf_staging, HostAccessType::Read)];
+            let readback_host_buffer_accesses = [(self.physical_resources.ids.buf_staging_read, HostAccessType::Read)];
             let readback_buffer_accesses = [];
             let readback_image_accesses = [];
             let start = std::time::Instant::now();
@@ -415,11 +614,11 @@ impl LocalFeaturesVulkan {
                             * size_of::<f32>() as u64;
                         let descriptors_offset = copy_keypoints_size;
                         let copy_size = copy_keypoints_size + copy_descriptors_size;
-                        let buf: &[u32] = tcx.read_buffer(self.physical_resources.ids.buf_staging, ..copy_size)?;
+                        let buf: &[u32] = tcx.read_buffer(self.physical_resources.ids.buf_staging_read, ..copy_size)?;
 
                         let n_total_keypoints = buf[keypoints_layout.offset_n_keypoints / size_of::<u32>()];
-                        let n_keypoints = n_total_keypoints.min(rt_max_keypoints) as usize;
-                        dropped_features = n_total_keypoints.saturating_sub(rt_max_keypoints);
+                        let n_keypoints = n_total_keypoints.min(global_context.rt_max_keypoints) as usize;
+                        dropped_features = n_total_keypoints.saturating_sub(global_context.rt_max_keypoints);
                         debug!(
                             "Keypoints readback: {}, ({} total, {} dropped)",
                             n_keypoints, n_total_keypoints, dropped_features
@@ -501,11 +700,11 @@ impl LocalFeaturesVulkan {
         filter_keypoints: Option<&mut dyn FilterBlobs>,
     ) -> Result<u32, crate::vulkan::VulkanError> {
         let readback_from_buffer = match self.fixed_params.use_staging_buffers {
-            StagingBuffers::Yes => self.physical_resources.ids.buf_staging,
+            StagingBuffers::Yes => self.physical_resources.ids.buf_staging_read,
             StagingBuffers::No => self.physical_resources.ids.buf_extremum_locations,
         };
         let result_buffer_id = match self.fixed_params.use_staging_buffers {
-            StagingBuffers::Yes => self.physical_resources.ids.buf_staging,
+            StagingBuffers::Yes => self.physical_resources.ids.buf_staging_write,
             StagingBuffers::No => self.physical_resources.ids.buf_filtered_extrema,
         };
         let readback_host_buffer_accesses =
@@ -577,6 +776,49 @@ impl LocalFeaturesVulkan {
         trace!("Extremum readback: Waited on flight");
         Ok(dropped_extrema)
     }
+
+    fn make_global_context(&self, img: &ArrayView2<f32>, params: &FeatureDetectParams) -> GlobalContext {
+        let width: u32 = img.ncols().try_into().expect("TODO");
+        let height: u32 = img.nrows().try_into().expect("TODO");
+        let rt_patch_pyr_levels = f32::min(width as f32, height as f32).log2().ceil().round() as u32;
+        let rt_max_extrema = self.fixed_params.max_extrema;
+        let rt_max_keypoints = self.fixed_params.max_keypoints;
+        let img_bytes = match self.fixed_params.precision {
+            Precision::Float32 => unsafe { std::slice::from_raw_parts(img.as_ptr() as *const _, img.len()) },
+            Precision::Float16 => {
+                todo!()
+            }
+        };
+        GlobalContext {
+            buffer_layouts: self.buffer_layouts.clone(),
+            fixed_params: self.fixed_params.clone(),
+            image_height: height,
+            image_width: width,
+            padded_width: width,
+            extremum_min_scale: params.min_keypoint_scale,
+            // TODO: start layer based on minimum feature size
+            extremum_skip_layers: 0,
+            contrast_threshold: params.extremum_min_response,
+            // reference to img is valid during this entire function, and the pointer created here
+            // is only ever read while a flight is executing, which we all wait on in this function
+            input_image: img_bytes,
+            physical_resources: self.physical_resources.clone(),
+            // TODO: check if extremum scan works with border
+            border: 0,
+            rt_max_extrema,
+            rt_max_keypoints,
+            rt_patch_pyr_levels,
+            patch_scale_factor: self.tweak_params.patch_scale_factor,
+
+            // set after blob filtering
+            n_filtered_extrema: 0,
+
+            // unused right now
+            edgeness_cm_low: params.edgeness_cm_low,
+            edgeness_cm_high: params.edgeness_cm_high,
+            fix_scale: false,
+        }
+    }
 }
 
 fn allocate_buffers(
@@ -606,21 +848,15 @@ fn allocate_buffers(
     let embeddings_or_descriptors_layout =
         DeviceLayout::new_unsized::<[f32]>(descriptors_len.max(embeddings_len)).unwrap();
 
-    let buf_staging: Id<Buffer> = match params.use_staging_buffers {
+    let buf_staging_write: Id<Buffer> = match params.use_staging_buffers {
         StagingBuffers::Yes => {
             let staging_layout = {
                 let align: u64 = 4; // only u32 and f32 in all buffers
-                let size = [
-                    constant_data_layout.size(),
-                    img_buffer_layout.size(),
-                    buffers.extremum_locations.layout.size(),
-                    buffers.filtered_extrema.layout.size(),
-                    // final readback is descriptors + keypoints
-                    descriptors_len * size_of::<f32>() as u64 + buffers.keypoints.layout.size(),
-                ]
-                .into_iter()
-                .max()
-                .expect("array not empty");
+                let size =
+                    [constant_data_layout.size(), img_buffer_layout.size(), buffers.filtered_extrema.layout.size()]
+                        .into_iter()
+                        .max()
+                        .expect("array not empty");
                 DeviceLayout::from_size_alignment(size, align)
             }
             .ok_or(crate::vulkan::VulkanError::TODO)?;
@@ -644,6 +880,24 @@ fn allocate_buffers(
             },
             img_buffer_layout,
         )?,
+    };
+    let buf_staging_read = {
+        let layout = {
+            let align: u64 = 4; // only u32 and f32 in all buffers
+            let size = buffers.extremum_locations.layout.size()
+                + descriptors_len * size_of::<f32>() as u64
+                + buffers.keypoints.layout.size();
+            DeviceLayout::from_size_alignment(size, align)
+        }
+        .ok_or(crate::vulkan::VulkanError::TODO)?;
+        resources.create_buffer(
+            &BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST, ..Default::default() },
+            &AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_RANDOM_ACCESS | MemoryTypeFilter::PREFER_HOST,
+                ..Default::default()
+            },
+            layout,
+        )?
     };
 
     let make_device_buffer = |layout| {
@@ -845,7 +1099,8 @@ fn allocate_buffers(
 
     Ok(PhysicalResources {
         ids: BufferIds {
-            buf_staging,
+            buf_staging_write,
+            buf_staging_read,
             img_patch_pyr: img_patch_pyr_id,
             img_patch_pyr_tmp: img_patch_pyr_scratch_id,
             buf_constants,
@@ -862,39 +1117,40 @@ fn allocate_buffers(
 }
 
 fn build_detect_taskgraph(
-    resources: &Arc<Resources>,
-    flight_id: Id<Flight>,
+    taskgraph: &mut TaskGraph<GlobalContext>,
+    virtual_ids: &BufferIds,
     params: &FixedParams,
-    buffers: &BufferLayouts,
+    buffer_layouts: &BufferLayouts,
     pipelines: &ComputePipelines,
-    vk: &Vulkan,
-) -> Result<Detect, crate::vulkan::VulkanError> {
-    use tasks_common::*;
+) -> Result<NodeId, crate::vulkan::VulkanError> {
     use tasks_detect::*;
 
-    let mut taskgraph: TaskGraph<GlobalContext> = TaskGraph::new(resources);
-
-    let virtual_ids = make_virtual_ids(&mut taskgraph);
-
     let upload_node_id = taskgraph
-        .create_task_node("upload", QueueFamilyType::Transfer, UploadImageTask { dst_buffer: virtual_ids.buf_staging })
+        .create_task_node(
+            "upload",
+            QueueFamilyType::Transfer,
+            UploadImageTask { dst_buffer: virtual_ids.buf_staging_write },
+        )
         .build();
-    taskgraph.add_host_buffer_access(virtual_ids.buf_staging, HostAccessType::Write);
+    taskgraph.add_host_buffer_access(virtual_ids.buf_staging_write, HostAccessType::Write);
 
     let copy_buffer_image_node_id = taskgraph
         .create_task_node(
             "copy image",
             QueueFamilyType::Compute,
-            CopyInputImageTask { buffer: virtual_ids.buf_staging, image: virtual_ids.img_coarse },
+            CopyInputImageTask { buffer: virtual_ids.buf_staging_write, image: virtual_ids.img_coarse },
         )
-        .buffer_access(virtual_ids.buf_staging, AccessTypes::COPY_TRANSFER_READ)
+        .buffer_access(virtual_ids.buf_staging_write, AccessTypes::COPY_TRANSFER_READ)
         .image_access(virtual_ids.img_coarse, AccessTypes::COPY_TRANSFER_WRITE, ImageLayoutType::General)
         .build();
     taskgraph.add_edge(upload_node_id, copy_buffer_image_node_id).unwrap();
 
     let buffers_to_zero = Vec::from([
-        (virtual_ids.buf_extremum_locations, (buffers.extremum_locations.offset_n_extrema + size_of::<u32>()) as u64),
-        (virtual_ids.buf_keypoints, (buffers.keypoints.offset_extremum_indices + size_of::<u32>()) as u64),
+        (
+            virtual_ids.buf_extremum_locations,
+            (buffer_layouts.extremum_locations.offset_n_extrema + size_of::<u32>()) as u64,
+        ),
+        (virtual_ids.buf_keypoints, (buffer_layouts.keypoints.offset_extremum_indices + size_of::<u32>()) as u64),
     ]);
     let zero_buffers_node_id = {
         let mut t = taskgraph.create_task_node(
@@ -1089,7 +1345,7 @@ fn build_detect_taskgraph(
             tmp_image_id: virtual_ids.img_patch_pyr_tmp,
         },
         pipelines.blur_pyramid.clone(),
-        &mut taskgraph,
+        taskgraph,
     );
     // Wait until all blurring is done so we don't switch/rebind pipelines every time,
     // since the pyramid involves a blur compute stage
@@ -1114,67 +1370,27 @@ fn build_detect_taskgraph(
     // Wait for pyramid blur shaders
     taskgraph.add_edge(pyr_end_node_id, scan_extrema_node_id).unwrap();
 
-    if params.use_staging_buffers == StagingBuffers::Yes {
-        let copy_size = buffers.extremum_locations.size_total;
-        let copy_node_id = taskgraph
-            .create_task_node(
-                "copy keypoints to staging",
-                QueueFamilyType::Transfer,
-                CopyBufferTask {
-                    src: virtual_ids.buf_extremum_locations,
-                    dst: virtual_ids.buf_staging,
-                    size: copy_size,
-                    src_offset: 0,
-                },
-            )
-            .buffer_access(virtual_ids.buf_staging, AccessTypes::COPY_TRANSFER_WRITE)
-            .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COPY_TRANSFER_READ)
-            .build();
-        taskgraph.add_host_buffer_access(virtual_ids.buf_staging, HostAccessType::Read);
-        taskgraph.add_edge(scan_extrema_node_id, copy_node_id).unwrap();
-    }
+    Ok(scan_extrema_node_id)
+}
 
-    let taskgraph = unsafe {
-        taskgraph
-            .compile(&CompileInfo { queues: &[&vk.queue], present_queue: None, flight_id, ..Default::default() })
-            .expect("TODO unhandled")
-    };
-    Ok(Detect { taskgraph, virtual_ids })
+enum ChainExtractTg {
+    Standalone,
+    ConnectTo { connect_node: NodeId, use_host_filtered_extremum_indices: bool },
 }
 
 fn build_extract_taskgraph(
-    resources: &Arc<Resources>,
-    flight_id: Id<Flight>,
+    taskgraph: &mut TaskGraph<GlobalContext>,
+    chain: ChainExtractTg,
+    virtual_ids: &BufferIds,
     params: &FixedParams,
-    buffer_layouts: &BufferLayouts,
     pipelines: &ComputePipelines,
-    vk: &Vulkan,
-) -> Result<Extract, crate::vulkan::VulkanError> {
-    use tasks_common::*;
+) -> Result<NodeId, crate::vulkan::VulkanError> {
     use tasks_extract::*;
 
-    let mut taskgraph: TaskGraph<GlobalContext> = TaskGraph::new(resources);
-
-    let virtual_ids = make_virtual_ids(&mut taskgraph);
-
-    let copy_node_id = (params.use_staging_buffers == StagingBuffers::Yes).then(|| {
-        taskgraph
-            .create_task_node(
-                "copy from staging",
-                QueueFamilyType::Transfer,
-                CopyBufferTask {
-                    src: virtual_ids.buf_staging,
-                    dst: virtual_ids.buf_filtered_extrema,
-                    // copying more than necessary, could use n_filtered_extrema instead
-                    size: buffer_layouts.filtered_extrema.size_total,
-                    src_offset: 0,
-                },
-            )
-            .buffer_access(virtual_ids.buf_staging, AccessTypes::COPY_TRANSFER_READ)
-            .buffer_access(virtual_ids.buf_filtered_extrema, AccessTypes::COPY_TRANSFER_WRITE)
-            .build()
-    });
-
+    let use_host_filtered_extremum_indices = match chain {
+        ChainExtractTg::Standalone => true,
+        ChainExtractTg::ConnectTo { use_host_filtered_extremum_indices, .. } => use_host_filtered_extremum_indices,
+    };
     let kp_ori_node_id = taskgraph
         .create_task_node(
             "keypoint orientation",
@@ -1184,6 +1400,7 @@ fn build_extract_taskgraph(
                 vbuf_filtered_extrema: virtual_ids.buf_filtered_extrema,
                 vbuf_extremum_locations: virtual_ids.buf_extremum_locations,
                 vbuf_keypoint_indices: virtual_ids.buf_keypoints,
+                use_host_filtered_extremum_idx: use_host_filtered_extremum_indices,
             },
         )
         .image_access(virtual_ids.img_patch_pyr, AccessTypes::COMPUTE_SHADER_SAMPLED_READ, ImageLayoutType::General)
@@ -1192,9 +1409,10 @@ fn build_extract_taskgraph(
         .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COMPUTE_SHADER_STORAGE_WRITE)
         .buffer_access(virtual_ids.buf_keypoints, AccessTypes::COMPUTE_SHADER_STORAGE_WRITE)
         .build();
-    if let Some(copy_node_id) = copy_node_id {
-        taskgraph.add_edge(copy_node_id, kp_ori_node_id).unwrap();
+    if let ChainExtractTg::ConnectTo { connect_node, .. } = chain {
+        taskgraph.add_edge(connect_node, kp_ori_node_id).unwrap();
     }
+
     let patch_gradients_node_id = taskgraph
         .create_task_node(
             "patches+gradients",
@@ -1280,28 +1498,7 @@ fn build_extract_taskgraph(
 
     taskgraph.add_edge(whiten_node_id, normalize_id).unwrap();
 
-    if params.use_staging_buffers == StagingBuffers::Yes {
-        let copy_node_id = taskgraph
-            .create_task_node(
-                "copy keypoints+descriptors to staging",
-                QueueFamilyType::Transfer,
-                DescriptorAndKeypointCopyTask { buffers: virtual_ids.clone() },
-            )
-            .buffer_access(virtual_ids.buf_staging, AccessTypes::COPY_TRANSFER_WRITE)
-            .buffer_access(virtual_ids.buf_embeddings_or_descriptors, AccessTypes::COPY_TRANSFER_READ)
-            .buffer_access(virtual_ids.buf_keypoints, AccessTypes::COPY_TRANSFER_READ)
-            .build();
-        taskgraph.add_edge(normalize_id, copy_node_id).unwrap();
-    } else {
-        taskgraph.add_host_buffer_access(virtual_ids.buf_embeddings_or_descriptors, HostAccessType::Read);
-    }
-
-    let taskgraph = unsafe {
-        taskgraph
-            .compile(&CompileInfo { queues: &[&vk.queue], present_queue: None, flight_id, ..Default::default() })
-            .expect("TODO unhandled")
-    };
-    Ok(Extract { taskgraph, virtual_ids })
+    Ok(normalize_id)
 }
 
 const fn size_of_return_value<F, T, U>(_f: &F) -> usize
@@ -1345,7 +1542,7 @@ fn upload_constant_data(
     let grad_angles = crate::mkd_ref::cart2pol(&crate::mkd_ref::mesh_grid().view()).slice_move(ndarray::s![1, .., ..]);
 
     let upload_to_buffer = match params.use_staging_buffers {
-        StagingBuffers::Yes => physical_resources.ids.buf_staging,
+        StagingBuffers::Yes => physical_resources.ids.buf_staging_write,
         StagingBuffers::No => physical_resources.ids.buf_extremum_locations,
     };
     let host_buffer_accesses = [(upload_to_buffer, HostAccessType::Write)];
@@ -1422,7 +1619,8 @@ fn resource_map<'a, W>(
 ) -> ResourceMap<'a> {
     resource_map!(taskgraph,
         virt.buf_constants => phys_buffers.buf_constants,
-        virt.buf_staging => phys_buffers.buf_staging,
+        virt.buf_staging_write => phys_buffers.buf_staging_write,
+        virt.buf_staging_read => phys_buffers.buf_staging_read,
         virt.buf_extremum_locations => phys_buffers.buf_extremum_locations,
         virt.buf_filtered_extrema => phys_buffers.buf_filtered_extrema,
         virt.buf_keypoints => phys_buffers.buf_keypoints,
@@ -1439,7 +1637,8 @@ fn resource_map<'a, W>(
 
 fn make_virtual_ids<W>(taskgraph: &mut TaskGraph<W>) -> BufferIds {
     BufferIds {
-        buf_staging: taskgraph.add_buffer(&BufferCreateInfo::default()),
+        buf_staging_write: taskgraph.add_buffer(&BufferCreateInfo::default()),
+        buf_staging_read: taskgraph.add_buffer(&BufferCreateInfo::default()),
         buf_constants: taskgraph.add_buffer(&BufferCreateInfo::default()),
         buf_patch_gradients_or_raw_descriptors: taskgraph.add_buffer(&BufferCreateInfo::default()),
         buf_embeddings_or_descriptors: taskgraph.add_buffer(&BufferCreateInfo::default()),
@@ -1482,4 +1681,73 @@ impl FilterBlobs for TopKContrastFilter {
             }
         }
     }
+}
+
+#[test]
+fn detect_nofiltering_same_as_all_noop_filter() {
+    use image::buffer::ConvertBuffer;
+    use nshare::IntoNdarray2;
+
+    struct NoOpFilter;
+    impl FilterBlobs for NoOpFilter {
+        fn filter<'r, 'w>(
+            &mut self,
+            blobs: Box<dyn Iterator<Item = BlobLocationsView<'r>> + 'w>,
+            out: FilterBlobsOutput<'w>,
+        ) {
+            let n: usize = blobs.map(|v| v.xs.len()).sum();
+            out.indices.extend(0..n as u32);
+        }
+    }
+
+    let vk = make_a_vulkan::Vulkan::new().unwrap();
+    let img = match image::open("../sample_data/bird.jpg").unwrap().grayscale() {
+        image::DynamicImage::ImageLuma8(img) => img,
+        _ => {
+            panic!("wrong image type");
+        }
+    };
+    let img_f32: image::ImageBuffer<image::Luma<f32>, Vec<f32>> = img.convert();
+    let img_f32 = img_f32.into_ndarray2();
+
+    let mut lf = LocalFeaturesVulkan::new(
+        BuildTimeParams {
+            n_scales: 5,
+            max_image_width: img.width(),
+            max_image_height: img.height(),
+            max_features: 5000,
+            max_blobs: 10000,
+            ..Default::default()
+        },
+        Default::default(),
+        vk,
+    )
+    .unwrap();
+
+    let result_nofilter = lf.detect_extract_all(&img_f32.view(), &Default::default()).unwrap();
+    let result_filter = lf.detect(&img_f32.view(), &Default::default(), Some(&mut NoOpFilter)).unwrap();
+    assert!(result_nofilter.keypoints.len() > 0);
+    assert_eq!(result_filter.keypoints.len(), result_nofilter.keypoints.len());
+
+    let sort_result = |mut res: FeaturesResult| {
+        let mut indices = (0..res.keypoints.len()).collect_vec();
+        indices.sort_by(|a, b| {
+            let kpa = &res.keypoints[*a];
+            let kpb = &res.keypoints[*b];
+            kpa.x
+                .total_cmp(&kpb.x)
+                .then(kpa.y.total_cmp(&kpb.y))
+                .then(kpa.angle.total_cmp(&kpb.angle))
+                .then(kpa.size.total_cmp(&kpb.size))
+                .then(kpa.response.total_cmp(&kpb.response))
+        });
+        res.keypoints = indices.iter().map(|i| res.keypoints[*i].clone()).collect_vec();
+        res.descriptors = res.descriptors.select(ndarray::Axis(0), &indices);
+        res
+    };
+    let result_nofilter_sorted = sort_result(result_nofilter.clone());
+    assert_eq!(result_nofilter_sorted.keypoints.len(), result_nofilter.keypoints.len());
+    let result_filter_sorted = sort_result(result_filter.clone());
+    assert_eq!(result_filter_sorted.keypoints.len(), result_filter.keypoints.len());
+    assert_eq!(result_filter_sorted, result_nofilter_sorted);
 }

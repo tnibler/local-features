@@ -19,6 +19,7 @@ pub(super) struct KeypointOrientationTask {
     pub vbuf_filtered_extrema: Id<Buffer>,
     pub vbuf_keypoint_indices: Id<Buffer>,
     pub pipeline: Arc<ComputePipeline>,
+    pub use_host_filtered_extremum_idx: bool,
 }
 
 impl Task for KeypointOrientationTask {
@@ -53,6 +54,8 @@ impl Task for KeypointOrientationTask {
                     height: world.image_height,
                     width: world.image_width,
                     rt_max_keypoints: world.rt_max_keypoints,
+                    rt_max_extrema: world.rt_max_extrema,
+                    use_filtered_extremum_index: if self.use_host_filtered_extremum_idx { 1 } else { 0 },
                 },
             )?;
             let wg_count = [world.n_filtered_extrema, 1, 1];
@@ -307,6 +310,8 @@ impl Task for FinalNormalizeTask {
 
 pub(super) struct DescriptorAndKeypointCopyTask {
     pub buffers: BufferIds,
+    /// Append extremum locations after descriptors (including n_extrema field)
+    pub read_extremum_locations: bool,
 }
 
 impl Task for DescriptorAndKeypointCopyTask {
@@ -324,13 +329,13 @@ impl Task for DescriptorAndKeypointCopyTask {
         unsafe {
             cbf.copy_buffer(&CopyBufferInfo {
                 src_buffer: self.buffers.buf_keypoints,
-                dst_buffer: self.buffers.buf_staging,
+                dst_buffer: self.buffers.buf_staging_read,
                 regions: &[BufferCopy { size: keypoints_copy_size, ..Default::default() }],
                 ..Default::default()
             })?;
             cbf.copy_buffer(&CopyBufferInfo {
                 src_buffer: self.buffers.buf_embeddings_or_descriptors,
-                dst_buffer: self.buffers.buf_staging,
+                dst_buffer: self.buffers.buf_staging_read,
                 regions: &[BufferCopy {
                     size: descriptor_copy_size,
                     dst_offset: keypoints_copy_size,
@@ -338,6 +343,18 @@ impl Task for DescriptorAndKeypointCopyTask {
                 }],
                 ..Default::default()
             })?;
+            if self.read_extremum_locations {
+                cbf.copy_buffer(&CopyBufferInfo {
+                    src_buffer: self.buffers.buf_extremum_locations,
+                    dst_buffer: self.buffers.buf_staging_read,
+                    regions: &[BufferCopy {
+                        size: world.buffer_layouts.extremum_locations.size_total,
+                        dst_offset: keypoints_copy_size + descriptor_copy_size,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })?;
+            }
         }
         Ok(())
     }
