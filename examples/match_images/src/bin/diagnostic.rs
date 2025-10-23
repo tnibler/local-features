@@ -54,9 +54,6 @@ fn main() -> Result<(), ()> {
     )
     .unwrap();
 
-    let min_size = 0.0;
-    let top_n = 2000;
-    info!("Limiting to best {top_n} features, minimum size {min_size}");
     let start = std::time::Instant::now();
     if let Some(rd) = do_renderdoc.as_mut() {
         rd.start_frame_capture(null(), null())
