@@ -82,7 +82,6 @@ pub enum Precision {
 }
 
 pub struct LocalFeaturesVulkan {
-    tweak_params: FeatureDetectParams,
     fixed_params: FixedParams,
     buffer_layouts: BufferLayouts,
     vk: Vulkan,
@@ -228,11 +227,7 @@ enum BlurDirection {
 }
 
 impl LocalFeaturesVulkan {
-    pub(crate) fn new(
-        params: BuildTimeParams,
-        tweak_params: FeatureDetectParams,
-        vk: Vulkan,
-    ) -> Result<Self, crate::vulkan::VulkanError> {
+    pub(crate) fn new(params: BuildTimeParams, vk: Vulkan) -> Result<Self, crate::vulkan::VulkanError> {
         let use_staging_buffers = StagingBuffers::Yes;
         let resources = Resources::new(
             &vk.device,
@@ -397,7 +392,6 @@ impl LocalFeaturesVulkan {
         Ok(Self {
             vk,
             resources,
-            tweak_params,
             fixed_params,
             buffer_layouts,
             detect_standalone,
@@ -808,7 +802,7 @@ impl LocalFeaturesVulkan {
             rt_max_extrema,
             rt_max_keypoints,
             rt_patch_pyr_levels,
-            patch_scale_factor: self.tweak_params.patch_scale_factor,
+            patch_scale_factor: params.patch_scale_factor,
 
             // set after blob filtering
             n_filtered_extrema: 0,
@@ -1382,7 +1376,7 @@ fn build_extract_taskgraph(
     taskgraph: &mut TaskGraph<GlobalContext>,
     chain: ChainExtractTg,
     virtual_ids: &BufferIds,
-    params: &FixedParams,
+    _params: &FixedParams,
     pipelines: &ComputePipelines,
 ) -> Result<NodeId, crate::vulkan::VulkanError> {
     use tasks_extract::*;
@@ -1719,7 +1713,6 @@ fn detect_nofiltering_same_as_all_noop_filter() {
             max_blobs: 10000,
             ..Default::default()
         },
-        Default::default(),
         vk,
     )
     .unwrap();

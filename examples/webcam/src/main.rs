@@ -28,7 +28,6 @@ fn make_local_features(
             max_blobs: 4 * MAX_FEATURES,
             ..Default::default()
         },
-        Default::default(),
     )
     .context("Error creating LocalFeaturesVulkan")
 }

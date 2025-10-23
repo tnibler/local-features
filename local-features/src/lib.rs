@@ -101,7 +101,6 @@ pub enum LocalFeaturesError {
 pub fn new_vulkan(
     vk: &vulkan::Vulkan,
     fixed_params: BuildTimeParams,
-    params: FeatureDetectParams,
 ) -> Result<LocalFeaturesVulkan, LocalFeaturesError> {
-    Ok(LocalFeaturesVulkan::new(fixed_params, params, vk.clone())?)
+    Ok(LocalFeaturesVulkan::new(fixed_params, vk.clone())?)
 }

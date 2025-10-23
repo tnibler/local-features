@@ -50,7 +50,6 @@ fn main() -> Result<(), ()> {
             max_blobs: 30000,
             ..Default::default()
         },
-        local_features::FeatureDetectParams::default(),
     )
     .unwrap();
 

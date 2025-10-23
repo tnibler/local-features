@@ -74,7 +74,6 @@ fn do_combinations(c: &mut Criterion, name: &str, scales_max_features: &[(f32, i
                 max_blobs: 2 * max_features as u32,
                 ..Default::default()
             },
-            local_features::FeatureDetectParams::default(),
         )
         .unwrap();
 
