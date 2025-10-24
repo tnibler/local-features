@@ -274,12 +274,11 @@ impl Task for ScanExtremaTask {
         let wg_count = {
             let wg_cover_x = (6 + 1) * 2;
             let wg_cover_y = (6 + 1) * 2;
-            let wg_cover_z = 7;
             // scan from start_layer to n_fine_scale - 1 (inclusive),
             [
                 (world.image_width - 2 * world.border).div_ceil(wg_cover_x),
                 (world.image_height - 2 * world.border).div_ceil(wg_cover_y),
-                (self.n_fine_scales - world.extremum_skip_layers).div_ceil(wg_cover_z),
+                1,
             ]
         };
         trace!("DoG Extrema: dispatch {:?}", wg_count);

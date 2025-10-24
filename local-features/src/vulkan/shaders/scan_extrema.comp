@@ -3,9 +3,8 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : enable
 #include "common.glsl"
 
-layout(constant_id = NUM_GLOBAL_CONSTANTS) const uint LAYERS_PER_WG = 5;
 // Square of this many quads is covered by one workgroup
-layout(constant_id = NUM_GLOBAL_CONSTANTS + 1) const uint SLICE_SIZE_HALF = 6;
+layout(constant_id = NUM_GLOBAL_CONSTANTS) const uint SLICE_SIZE_HALF = 6;
 
 const uint WG_SIZE = 64;
 layout(local_size_x = WG_SIZE) in;
