@@ -5,7 +5,7 @@ use fxhash::FxHashMap;
 use index_vec::IndexVec;
 use itertools::Itertools as _;
 use log::{debug, trace};
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array2, Array3, ArrayView2};
 use shaders::ComputePipelines;
 use thiserror::Error;
 use vulkano::{
@@ -31,7 +31,8 @@ use vulkano_taskgraph::{
 
 use crate::{
     BuildTimeParams, DESCRIPTOR_LEN, DIMS_EMB_CARTESIAN, DIMS_EMB_POLAR, DIMS_INPUT, FeatureDetectParams,
-    FeaturesResult, Keypoint, MKDPCA, PATCH_SIZE, RAW_DESCRIPTOR_LEN, vulkan::patch_pyramid::BlitCopyImageTask,
+    FeaturesResult, Keypoint, MKDPCA, PATCH_SIZE, RAW_DESCRIPTOR_LEN,
+    vulkan::{patch_pyramid::BlitCopyImageTask, tasks_common::CopyBufferTask},
 };
 
 mod make_a_vulkan;
@@ -131,6 +132,7 @@ struct FixedParams {
     pub extremum_block_len: u32,
 
     pub patch_pyr_levels: u32,
+    pub debug_readout_patches: bool,
 }
 
 #[derive(Clone)]
@@ -158,6 +160,7 @@ struct BufferIds {
     buf_keypoints: Id<Buffer>,
     buf_patch_gradients_or_raw_descriptors: Id<Buffer>,
     buf_embeddings_or_descriptors: Id<Buffer>,
+    buf_staging_debug: Option<Id<Buffer>>,
 
     img_coarse: Id<Image>,
     img_scratch: Id<Image>,
@@ -255,6 +258,7 @@ impl LocalFeaturesVulkan {
             patch_pyr_levels,
             extremum_block_len: block_len,
             pca: params.pca,
+            debug_readout_patches: params.debug_readout_patches,
         };
 
         let buffer_layouts = BufferLayouts {
@@ -269,7 +273,7 @@ impl LocalFeaturesVulkan {
 
         let detect_standalone = {
             let mut tg = TaskGraph::new(&resources);
-            let virtual_ids = make_virtual_ids(&mut tg);
+            let virtual_ids = make_virtual_ids(&mut tg, &fixed_params);
 
             let last_detect_node =
                 build_detect_taskgraph(&mut tg, &virtual_ids, &fixed_params, &buffer_layouts, &pipelines)?;
@@ -302,7 +306,7 @@ impl LocalFeaturesVulkan {
 
         let extract_standalone = {
             let mut tg = TaskGraph::new(&resources);
-            let virtual_ids = make_virtual_ids(&mut tg);
+            let virtual_ids = make_virtual_ids(&mut tg, &fixed_params);
 
             let chain_extract = if fixed_params.use_staging_buffers == StagingBuffers::Yes {
                 // Copy in host filtered extremum indices from staging
@@ -353,7 +357,7 @@ impl LocalFeaturesVulkan {
 
         let detect_extract_all = {
             let mut tg = TaskGraph::new(&resources);
-            let virtual_ids = make_virtual_ids(&mut tg);
+            let virtual_ids = make_virtual_ids(&mut tg, &fixed_params);
 
             let last_detect_node =
                 build_detect_taskgraph(&mut tg, &virtual_ids, &fixed_params, &buffer_layouts, &pipelines)?;
@@ -688,6 +692,34 @@ impl LocalFeaturesVulkan {
         Ok(FeaturesResult { keypoints, descriptors, dropped_blobs: dropped_extrema, dropped_features })
     }
 
+    pub fn debug_read_patches(&mut self) -> Result<Array3<f32>, VulkanError> {
+        assert!(
+            self.fixed_params.debug_readout_patches,
+            "Instance must have been created with debug_readout_patches set"
+        );
+        let mut data: Vec<f32> = Vec::with_capacity(self.fixed_params.max_keypoints as usize * 32 * 32);
+        let buf_staging_debug = self.physical_resources.ids.buf_staging_debug.expect("must be Some");
+        unsafe {
+            vulkano_taskgraph::execute(
+                &self.vk.queue,
+                &self.resources,
+                self.flight_id,
+                |_cbf, tcx| {
+                    let copy_size = u64::from(self.fixed_params.max_keypoints) * 32 * 32 * size_of::<f32>() as u64;
+                    let buf: &[f32] = tcx.read_buffer(buf_staging_debug, ..copy_size)?;
+                    data.extend(buf);
+                    Ok(())
+                },
+                [(buf_staging_debug, HostAccessType::Read)],
+                [],
+                [],
+            )
+            .expect("TODO");
+        }
+        self.resources.flight(self.flight_id).unwrap().wait(None)?;
+        Ok(Array3::from_shape_vec((self.fixed_params.max_keypoints as usize, 32, 32), data).expect("shape is correct"))
+    }
+
     fn do_extremum_readback(
         &mut self,
         global_context: &mut GlobalContext,
@@ -831,7 +863,7 @@ fn allocate_buffers(
 
     let constant_data_layout = DeviceLayout::new_sized::<shaders::shaders_f32::ConstantData>();
 
-    let patch_gradients_len: u64 = 2 * max_keypoints * patch_size_sq;
+    let patch_gradients_len: u64 = if params.debug_readout_patches { 3 } else { 2 } * max_keypoints * patch_size_sq;
     let raw_descriptors_len: u64 = max_keypoints * RAW_DESCRIPTOR_LEN as u64;
     let patch_gradients_or_raw_descriptors_layout =
         DeviceLayout::new_unsized::<[f32]>(patch_gradients_len.max(raw_descriptors_len)).expect("TODO");
@@ -892,6 +924,20 @@ fn allocate_buffers(
             },
             layout,
         )?
+    };
+    let buf_staging_debug = if params.debug_readout_patches {
+        let patches_len = u64::from(params.max_keypoints) * 32 * 32;
+        let buf = resources.create_buffer(
+            &BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST, ..Default::default() },
+            &AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_RANDOM_ACCESS | MemoryTypeFilter::PREFER_HOST,
+                ..Default::default()
+            },
+            DeviceLayout::new_unsized::<[f32]>(patches_len).expect("is valid buffer size"),
+        )?;
+        Some(buf)
+    } else {
+        None
     };
 
     let make_device_buffer = |layout| {
@@ -1095,6 +1141,7 @@ fn allocate_buffers(
         ids: BufferIds {
             buf_staging_write,
             buf_staging_read,
+            buf_staging_debug,
             img_patch_pyr: img_patch_pyr_id,
             img_patch_pyr_tmp: img_patch_pyr_scratch_id,
             buf_constants,
@@ -1376,7 +1423,7 @@ fn build_extract_taskgraph(
     taskgraph: &mut TaskGraph<GlobalContext>,
     chain: ChainExtractTg,
     virtual_ids: &BufferIds,
-    _params: &FixedParams,
+    params: &FixedParams,
     pipelines: &ComputePipelines,
 ) -> Result<NodeId, crate::vulkan::VulkanError> {
     use tasks_extract::*;
@@ -1407,19 +1454,50 @@ fn build_extract_taskgraph(
         taskgraph.add_edge(connect_node, kp_ori_node_id).unwrap();
     }
 
-    let patch_gradients_node_id = taskgraph
-        .create_task_node(
-            "patches+gradients",
-            QueueFamilyType::Compute,
-            PatchBlurGradientTask { pipeline: pipelines.patch_gradients.clone(), buffers: virtual_ids.clone() },
-        )
-        .buffer_access(virtual_ids.buf_patch_gradients_or_raw_descriptors, AccessTypes::COMPUTE_SHADER_STORAGE_WRITE)
-        .buffer_access(virtual_ids.buf_keypoints, AccessTypes::COMPUTE_SHADER_STORAGE_READ)
-        .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COMPUTE_SHADER_STORAGE_READ)
-        .image_access(virtual_ids.img_patch_pyr, AccessTypes::COMPUTE_SHADER_SAMPLED_READ, ImageLayoutType::General)
-        .build();
-
-    taskgraph.add_edge(kp_ori_node_id, patch_gradients_node_id).unwrap();
+    let patch_gradients_node_id = {
+        let gradients_node = taskgraph
+            .create_task_node(
+                "patches+gradients",
+                QueueFamilyType::Compute,
+                PatchBlurGradientTask { pipeline: pipelines.patch_gradients.clone(), buffers: virtual_ids.clone() },
+            )
+            .buffer_access(
+                virtual_ids.buf_patch_gradients_or_raw_descriptors,
+                AccessTypes::COMPUTE_SHADER_STORAGE_WRITE,
+            )
+            .buffer_access(virtual_ids.buf_keypoints, AccessTypes::COMPUTE_SHADER_STORAGE_READ)
+            .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COMPUTE_SHADER_STORAGE_READ)
+            .buffer_access(
+                virtual_ids.buf_patch_gradients_or_raw_descriptors,
+                AccessTypes::COMPUTE_SHADER_STORAGE_WRITE,
+            )
+            .image_access(virtual_ids.img_patch_pyr, AccessTypes::COMPUTE_SHADER_SAMPLED_READ, ImageLayoutType::General)
+            .build();
+        taskgraph.add_edge(kp_ori_node_id, gradients_node).unwrap();
+        if params.debug_readout_patches {
+            let copy_patches_node = taskgraph
+                .create_task_node(
+                    "Copy patches to staging",
+                    QueueFamilyType::Transfer,
+                    CopyBufferTask {
+                        src: virtual_ids.buf_patch_gradients_or_raw_descriptors,
+                        dst: virtual_ids.buf_staging_debug.expect("must be Some if debug patches enabled"),
+                        size: u64::from(params.max_keypoints) * 32 * 32 * size_of::<f32>() as u64,
+                        src_offset: 2 * u64::from(params.max_keypoints) * 32 * 32 * size_of::<f32>() as u64,
+                    },
+                )
+                .buffer_access(virtual_ids.buf_patch_gradients_or_raw_descriptors, AccessTypes::COPY_TRANSFER_READ)
+                .buffer_access(
+                    virtual_ids.buf_staging_debug.expect("must be Some if debug patches enabled"),
+                    AccessTypes::COPY_TRANSFER_WRITE,
+                )
+                .build();
+            taskgraph.add_edge(gradients_node, copy_patches_node).unwrap();
+            copy_patches_node
+        } else {
+            gradients_node
+        }
+    };
 
     let embedding_polar_node_id = taskgraph
         .create_task_node(
@@ -1611,7 +1689,7 @@ fn resource_map<'a, W>(
     virt: &BufferIds,
     phys_buffers: &BufferIds,
 ) -> ResourceMap<'a> {
-    resource_map!(taskgraph,
+    let mut rm = resource_map!(taskgraph,
         virt.buf_constants => phys_buffers.buf_constants,
         virt.buf_staging_write => phys_buffers.buf_staging_write,
         virt.buf_staging_read => phys_buffers.buf_staging_read,
@@ -1626,10 +1704,14 @@ fn resource_map<'a, W>(
         virt.img_patch_pyr => phys_buffers.img_patch_pyr,
         virt.img_patch_pyr_tmp => phys_buffers.img_patch_pyr_tmp,
     )
-    .expect("TODO")
+    .expect("TODO");
+    if let Some(phys_debug) = phys_buffers.buf_staging_debug {
+        rm.insert_buffer(virt.buf_staging_debug.expect("must be Some"), phys_debug).expect("TODO");
+    }
+    rm
 }
 
-fn make_virtual_ids<W>(taskgraph: &mut TaskGraph<W>) -> BufferIds {
+fn make_virtual_ids<W>(taskgraph: &mut TaskGraph<W>, params: &FixedParams) -> BufferIds {
     BufferIds {
         buf_staging_write: taskgraph.add_buffer(&BufferCreateInfo::default()),
         buf_staging_read: taskgraph.add_buffer(&BufferCreateInfo::default()),
@@ -1639,6 +1721,7 @@ fn make_virtual_ids<W>(taskgraph: &mut TaskGraph<W>) -> BufferIds {
         buf_extremum_locations: taskgraph.add_buffer(&BufferCreateInfo::default()),
         buf_keypoints: taskgraph.add_buffer(&BufferCreateInfo::default()),
         buf_filtered_extrema: taskgraph.add_buffer(&BufferCreateInfo::default()),
+        buf_staging_debug: params.debug_readout_patches.then(|| taskgraph.add_buffer(&BufferCreateInfo::default())),
         img_coarse: taskgraph.add_image(&ImageCreateInfo::default()),
         img_scratch: taskgraph.add_image(&ImageCreateInfo::default()),
         img_patch_pyr: taskgraph.add_image(&ImageCreateInfo::default()),

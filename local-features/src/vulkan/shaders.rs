@@ -126,7 +126,6 @@ pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipe
                 Precision::Float32 => shaders_f32::$func(&vk.device),
                 Precision::Float16 => {
                     todo!()
-                    // shaders::scale_space::detect_f16::$func(vk.device.clone())
                 }
             }?
             .specialize(&specialization_constants)
@@ -143,7 +142,19 @@ pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipe
     let blur_pyramid_stage = shader_stage!(load_blur_pyramid);
 
     let keypoint_orientation_stage = shader_stage!(load_keypoint_orientation);
-    let patch_gradients_stage = shader_stage!(load_patch_gradients);
+    let patch_gradients_stage = {
+        let mut spec_consts = specialization_constants.to_vec();
+        spec_consts.push((5, SpecializationConstant::U32(if params.debug_readout_patches { 1 } else { 0 })));
+        let shader = match params.precision {
+            Precision::Float32 => shaders_f32::load_patch_gradients(&vk.device),
+            Precision::Float16 => {
+                todo!()
+            }
+        }?
+        .specialize(&spec_consts)
+        .expect(SPECIALIZATION_PANIC_MSG);
+        shader.entry_point("main").expect("main exists")
+    };
     let embedding_polar_stage = shader_stage!(load_embedding_polar);
     let embedding_cartesian_stage = shader_stage!(load_embedding_cartesian);
     let embedding_sum_stage = shader_stage!(load_normalize);

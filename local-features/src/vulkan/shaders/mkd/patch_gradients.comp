@@ -3,6 +3,8 @@
 #include "../common.glsl"
 #include "swizzle.glsl"
 
+layout(constant_id = NUM_GLOBAL_CONSTANTS) const uint DEBUG_WRITE_PATCHES = 0;
+
 layout(local_size_x = 32, local_size_y = 32) in;
 
 layout(push_constant) uniform PatchGradientsPc {
@@ -69,6 +71,10 @@ void main() {
                 // in the general case.
                 kp_scale_level - 1
             ).r;
+        }
+        if (DEBUG_WRITE_PATCHES == 1) {
+            const uint idx = local_y * PATCH_SIZE + local_x;
+            patch_gradients.patches[2 * MAX_KEYPOINTS + patch_index].data[idx] = sh_patch[idx];
         }
         barrier();
     }

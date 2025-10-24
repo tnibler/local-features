@@ -1,7 +1,9 @@
 use std::ptr::null;
 
-use image::buffer::ConvertBuffer as _;
+use image::{GrayImage, Luma, buffer::ConvertBuffer as _};
+use imageproc::definitions::Image;
 use log::info;
+use ndarray::{Array2, Axis, s};
 use nshare::AsNdarray2 as _;
 
 fn main() -> Result<(), ()> {
@@ -22,16 +24,23 @@ fn main() -> Result<(), ()> {
     };
 
     let mut args = pico_args::Arguments::from_env();
-    let mut do_renderdoc = if let Some("renderdoc") = args.subcommand().unwrap().as_deref() {
+    let command = args.subcommand().unwrap().expect("need subcommand");
+    let mut do_renderdoc = if command == "renderdoc" {
         let rd = renderdoc::RenderDoc::<renderdoc::V140>::new().unwrap();
         Some(rd)
     } else {
         None
     };
-    let path: String = args.free_from_str().expect("need input image path");
+    let do_patches = command == "patches";
+    let input_path: String = args.free_from_str().expect("need input image path");
+    let out_path: Option<String> = if command == "patches" {
+        Some(args.free_from_str().expect("need output image path"))
+    } else {
+        None
+    };
     args.finish();
 
-    let img = match image::open(path).unwrap().grayscale() {
+    let img = match image::open(input_path).unwrap().grayscale() {
         image::DynamicImage::ImageLuma8(img) => img,
         _ => {
             eprintln!("wrong image type");
@@ -48,6 +57,7 @@ fn main() -> Result<(), ()> {
             max_image_height: img.height(),
             max_features: 10000,
             max_blobs: 30000,
+            debug_readout_patches: do_patches,
             ..Default::default()
         },
     )
@@ -66,6 +76,40 @@ fn main() -> Result<(), ()> {
         rd.end_frame_capture(null(), null())
     }
     let time = start.elapsed();
+
+    if do_patches {
+        let patches = feats.debug_read_patches().unwrap();
+        let n_patches = result.keypoints.len();
+
+        let ps = 32;
+        let grid_side = (n_patches as f32).sqrt().ceil() as usize;
+        let width = grid_side * ps;
+        let height = grid_side * ps;
+
+        let mut patch_image = Array2::<f32>::zeros((height, width));
+
+        for (i, patch) in patches.axis_iter(Axis(0)).take(n_patches).enumerate() {
+            let r = i / grid_side;
+            let c = i % grid_side;
+
+            let start_row = r * ps;
+            let end_row = start_row + ps;
+            let start_col = c * ps;
+            let end_col = start_col + ps;
+
+            let mut slice = patch_image.slice_mut(s![start_row..end_row, start_col..end_col]);
+            slice.assign(&patch);
+        }
+        // patch_image *= 255.0;
+        let patch_image: Image<Luma<f32>> = Image::from_raw(
+            width as u32,
+            height as u32,
+            patch_image.into_raw_vec_and_offset().0,
+        )
+        .unwrap();
+        let patch_image: GrayImage = patch_image.convert();
+        patch_image.save(out_path.unwrap()).unwrap();
+    }
 
     if result.dropped_blobs > 0 || result.dropped_features > 0 {
         info!(
