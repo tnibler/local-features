@@ -163,6 +163,13 @@ void check_extremum(int x, int y, int fine_scale) {
             return;
         } 
 
+        const float extremum_x = float(wg_coords.x + x) + offset_x;
+        const float extremum_y = float(wg_coords.y + y) + offset_y;
+        if (extremum_x < border || extremum_x >= width - border
+            || extremum_y < border || extremum_y >= height - border) {
+            return;
+        }
+
         const float interp_value = offset_scale * dds + offset_y * ddy + offset_x * ddx;
 
         const float contrast = abs(at(z, y, x) + interp_value / 2.0);
@@ -191,8 +198,6 @@ void check_extremum(int x, int y, int fine_scale) {
 
         const uint extremum_idx = atomicAdd(sh_n_extrema, 1);
         if (extremum_idx < max_wg_extrema) {
-            const float extremum_x = float(wg_coords.x + x) + offset_x;
-            const float extremum_y = float(wg_coords.y + y) + offset_y;
             sh_extremum_x[extremum_idx] = extremum_x;
             sh_extremum_y[extremum_idx] = extremum_y;
             sh_extremum_scale[extremum_idx] = size;
