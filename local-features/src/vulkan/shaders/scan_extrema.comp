@@ -308,7 +308,7 @@ void main() {
         barrier();
     }
 
-    const uint n_extrema = sh_n_extrema;
+    const uint n_extrema = min(sh_n_extrema, max_wg_extrema);
     barrier();
     if (gl_LocalInvocationIndex == 0) {
         const uint first_extremum_idx = atomicAdd(extremum_locations.n_extrema, n_extrema);
