@@ -1827,3 +1827,57 @@ fn detect_nofiltering_same_as_all_noop_filter() {
     assert_eq!(result_filter_sorted.keypoints.len(), result_filter.keypoints.len());
     assert_eq!(result_filter_sorted, result_nofilter_sorted);
 }
+
+#[test]
+// this isn't a great test, more of a sanity check if things are really wrong.
+fn mkd_matches_ref() {
+    use crate::mkd_ref;
+    use image::buffer::ConvertBuffer;
+    use ndarray::s;
+    use nshare::IntoNdarray2;
+    let vk = make_a_vulkan::Vulkan::new().unwrap();
+    let img = match image::open("../sample_data/bird.jpg").unwrap().grayscale() {
+        image::DynamicImage::ImageLuma8(img) => img,
+        _ => {
+            panic!("wrong image type");
+        }
+    };
+    let img_f32: image::ImageBuffer<image::Luma<f32>, Vec<f32>> = img.convert();
+    let img_f32 = img_f32.into_ndarray2();
+
+    let mut lf = LocalFeaturesVulkan::new(
+        BuildTimeParams {
+            n_scales: 6,
+            max_image_width: img.width(),
+            max_image_height: img.height(),
+            max_features: 5000,
+            max_blobs: 10000,
+            debug_readout_patches: true,
+            ..Default::default()
+        },
+        vk,
+    )
+    .unwrap();
+    let FeaturesResult { descriptors, .. } = lf.detect_extract_all(&img_f32.view(), &Default::default()).unwrap();
+    let patches = lf.debug_read_patches().unwrap().slice_move(s![..descriptors.shape()[0], .., ..]);
+
+    let mkd = crate::mkd_ref::Mkd::new(&mkd_ref::MkdOptions { whitening: mkd_ref::Whitening::PcaAttenutated });
+    #[derive(Debug)]
+    #[allow(unused)]
+    struct FailedCase {
+        index: usize,
+        l2: f32,
+        max_diff: f32,
+    }
+    let mut failures = Vec::new();
+    for (i, (patch, actual)) in patches.outer_iter().zip_eq(descriptors.outer_iter()).enumerate() {
+        let expected = mkd.patch(&patch);
+        let diff = expected.clone() - actual;
+        let max_diff = diff.abs().iter().copied().max_by(f32::total_cmp).unwrap();
+        let l2 = diff.pow2().sum().sqrt();
+        if l2 >= 1e-3 || max_diff >= 1e-3 {
+            failures.push(FailedCase { index: i, l2, max_diff });
+        }
+    }
+    assert_eq!(failures.len(), 0, "Failures:\n{:?}", failures);
+}
