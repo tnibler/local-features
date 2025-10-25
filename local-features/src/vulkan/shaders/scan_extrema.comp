@@ -216,10 +216,6 @@ void write_quad_to_ringbuffer(vec4 quad, uint layer, uint x, uint y) {
 }
 
 
-float normalize_factor(int scale) {
-    return pow(2, scale);
-}
-
 float vec4_max(vec4 v) {
     return max(v.x, max(v.y, max(v.z, v.w)));
 }
@@ -267,7 +263,7 @@ void main() {
     for (int i = int(skip_layers); i < int(skip_layers) + 3; i++) {
         // FIXME: handle skip_layers here, make sure fine_scale idx is correct
         const vec4 quad = load_quad(wg_coords + ivec3(load_quad_x, load_quad_y, i + 1));
-        const vec4 dog = (quad - prev_scale_quad) * normalize_factor(i);
+        const vec4 dog = (quad - prev_scale_quad);
 
         write_quad_to_ringbuffer(dog, layer_rb_idx, wg_quad_x, wg_quad_y);
         layer_rb_idx = (layer_rb_idx + 1) % int(RINGBUF_LAYERS);
@@ -298,7 +294,7 @@ void main() {
         }
 
         if (fine_scale + 2 < n_fine_levels) {
-            const vec4 dog = (next_scale_quad - prev_scale_quad) * normalize_factor(fine_scale + 2);
+            const vec4 dog = (next_scale_quad - prev_scale_quad);
             running_abs_argmax <<= 4;
             running_abs_argmax |= abs_argmax(dog);
 
