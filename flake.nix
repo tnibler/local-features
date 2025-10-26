@@ -183,7 +183,6 @@
             packages = with pkgs; [
               toolchain
 
-              gpp
               vulkan-tools
               vulkan-tools-lunarg
               vulkan-validation-layers
@@ -231,6 +230,10 @@
                 xorg.libXdmcp
                 xorg.libXau
                 libxkbcommon
+                zlib
+                stdenv.cc.cc.lib
+                libGL
+                glib
               ]);
             };
           };

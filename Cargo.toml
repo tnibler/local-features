@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["local-features", "examples/*", "benchmarks"]
+members = ["local-features", "examples/*", "benchmarks", "python"]
 
 [workspace.dependencies]
 local-features = { path = "./local-features/" }
