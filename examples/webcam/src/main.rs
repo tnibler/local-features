@@ -21,7 +21,7 @@ fn make_local_features(
     local_features::new_vulkan(
         vulkan,
         local_features::BuildTimeParams {
-            n_scales: 5,
+            n_scales: 6,
             max_image_width: width,
             max_image_height: height,
             max_features: MAX_FEATURES,
@@ -104,9 +104,10 @@ fn make_match_image(
 ) -> MatchImage {
     let index = usearch::Index::new(&usearch::IndexOptions {
         dimensions: 128,
-        metric: usearch::MetricKind::IP,
+        metric: usearch::MetricKind::Cos,
         quantization: usearch::ScalarKind::F32,
         multi: true,
+        connectivity: 8,
         ..Default::default()
     })
     .unwrap();
@@ -121,6 +122,29 @@ fn make_match_image(
         index,
         keypoints: feats.keypoints,
     }
+}
+
+fn do_matching(match_image: &MatchImage, res_query: &FeaturesResult) -> Vec<(Keypoint, Keypoint)> {
+    let FeaturesResult {
+        keypoints,
+        descriptors,
+        ..
+    } = res_query;
+    let mut matches_ = Vec::new();
+    for (kp, desc) in keypoints
+        .iter()
+        .zip(descriptors.axis_iter(ndarray::Axis(0)))
+    {
+        let matches = match_image
+            .index
+            .search(desc.as_slice().unwrap(), 2)
+            .unwrap();
+        if matches.distances[0] < matches.distances[1] * 0.75 {
+            let kp_match = match_image.keypoints[matches.keys[0] as usize];
+            matches_.push((*kp, kp_match));
+        }
+    }
+    matches_
 }
 
 impl App for WebcamDemo {
@@ -206,6 +230,14 @@ impl App for WebcamDemo {
             });
         });
 
+        let matching_start = std::time::Instant::now();
+        let kp_matches = if let Some(m) = self.match_image.as_ref() {
+            do_matching(m, &feature_result)
+        } else {
+            Vec::new()
+        };
+        let matching_time = matching_start.elapsed();
+
         TopBottomPanel::bottom("bottom panel").show(ctx, |panel| {
             panel.vertical(|ui| {
                 let slider = egui::Slider::new(&mut self.min_feature_size, 0f32..=32.)
@@ -216,10 +248,21 @@ impl App for WebcamDemo {
                     .text("Max. Features");
                 ui.add(slider);
             });
-            panel.label(format!(
-                "Feature extraction time: {}ms",
-                extract_time.as_millis()
-            ));
+            panel.horizontal(|ui| {
+                ui.label(format!(
+                    "Feature extraction time: {}ms",
+                    extract_time.as_millis()
+                ));
+                ui.label(format!(
+                    "Matching {} to {} features: {}ms",
+                    feature_result.keypoints.len(),
+                    self.match_image
+                        .as_ref()
+                        .map(|m| m.keypoints.len())
+                        .unwrap_or(0),
+                    matching_time.as_millis()
+                ));
+            })
         });
 
         CentralPanel::default().show(ctx, |panel| {
@@ -269,45 +312,21 @@ impl App for WebcamDemo {
                         );
                     }
 
-                    let FeaturesResult {
-                        keypoints,
-                        descriptors,
-                        ..
-                    } = feature_result;
-                    for (kp, desc) in keypoints
-                        .iter()
-                        .zip(descriptors.axis_iter(ndarray::Axis(0)))
-                    {
-                        let matches = match_image
-                            .index
-                            .search(desc.as_slice().unwrap(), 2)
-                            .unwrap();
-                        if matches.distances[0] < matches.distances[1] * 0.75 {
-                            let kp_match = match_image.keypoints[matches.keys[0] as usize];
-
-                            painter.line_segment(
-                                [
-                                    Pos2::new(
-                                        rect_cam.left() + kp.x * cam_scale,
-                                        rect_cam.top() + kp.y * cam_scale,
-                                    ),
-                                    Pos2::new(
-                                        rect_snap.left() + kp_match.x * snap_scale,
-                                        rect_snap.top() + kp_match.y * snap_scale,
-                                    ),
-                                ],
-                                Stroke::new(1., egui::Color32::WHITE),
-                            );
-                        }
+                    for (kp1, kp2) in kp_matches {
+                        painter.line_segment(
+                            [
+                                Pos2::new(
+                                    rect_cam.left() + kp1.x * cam_scale,
+                                    rect_cam.top() + kp1.y * cam_scale,
+                                ),
+                                Pos2::new(
+                                    rect_snap.left() + kp2.x * snap_scale,
+                                    rect_snap.top() + kp2.y * snap_scale,
+                                ),
+                            ],
+                            Stroke::new(1., egui::Color32::WHITE),
+                        );
                     }
-
-                    painter.line_segment(
-                        [
-                            Pos2::new(rect_cam.left() + 10., rect_cam.top() + 20.),
-                            Pos2::new(rect_snap.left() + 10., rect_snap.bottom() - 20.),
-                        ],
-                        Stroke::new(1., egui::Color32::WHITE),
-                    );
                 }
             });
         });
