@@ -87,22 +87,42 @@ fn do_combinations(c: &mut Criterion, name: &str, scales_max_features: &[(f32, i
         #[cfg(feature = "vulkansift")]
         {
             use benchmarks::{VulkanSift, VulkanSiftConfig};
-            let config = VulkanSiftConfig {
-                max_image_width: width,
-                max_image_height: height,
-                do_upscale: true,
-                max_features: max_features as u32,
-            };
-            let mut vk_sift =
-                unsafe { VulkanSift::new(config).expect("Error creating VulkanSift") };
+            {
+                let config = VulkanSiftConfig {
+                    max_image_width: width,
+                    max_image_height: height,
+                    do_upscale: true,
+                    max_features: max_features as u32,
+                };
+                let mut vk_sift =
+                    unsafe { VulkanSift::new(config).expect("Error creating VulkanSift") };
 
-            group.bench_with_input(
-                BenchmarkId::new("VulkanSIFT", &input_name),
-                &input,
-                |b, _| {
-                    b.iter(|| vk_sift.detect(image.as_raw(), width, height));
-                },
-            );
+                group.bench_with_input(
+                    BenchmarkId::new("VulkanSIFT", &input_name),
+                    &input,
+                    |b, _| {
+                        b.iter(|| vk_sift.detect(image.as_raw(), width, height));
+                    },
+                );
+            }
+            {
+                let config = VulkanSiftConfig {
+                    max_image_width: width,
+                    max_image_height: height,
+                    do_upscale: false,
+                    max_features: max_features as u32,
+                };
+                let mut vk_sift =
+                    unsafe { VulkanSift::new(config).expect("Error creating VulkanSift") };
+
+                group.bench_with_input(
+                    BenchmarkId::new("VulkanSIFT NoUpscale", &input_name),
+                    &input,
+                    |b, _| {
+                        b.iter(|| vk_sift.detect(image.as_raw(), width, height));
+                    },
+                );
+            }
         }
 
         #[cfg(feature = "opencv")]

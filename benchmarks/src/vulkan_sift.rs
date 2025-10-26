@@ -56,7 +56,7 @@ impl VulkanSift {
             let mut vk_config = bindings::vksift_getDefaultConfig();
             vk_config.sift_buffer_count = 1;
             vk_config.use_hardware_interpolated_blur = true;
-            vk_config.use_input_upsampling = true;
+            vk_config.use_input_upsampling = config.do_upscale;
             vk_config.pyramid_precision_mode =
                 bindings::vksift_PyramidPrecisionMode_VKSIFT_PYRAMID_PRECISION_FLOAT32;
             vk_config.max_nb_sift_per_buffer = config.max_features;

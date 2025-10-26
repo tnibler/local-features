@@ -35,19 +35,54 @@ df = pl.DataFrame(rows).with_columns(resolution=pl.format('{}x{}', pl.col('width
 out_dir = Path('images')
 out_dir.mkdir(exist_ok=True)
 
-g = sns.catplot(df.filter(pl.col('facet').eq('Image Size')), kind='bar', x='resolution', y='time', hue='Method')
+order = ["OpenCV SIFT", "VulkanSIFT", "VulkanSIFT NoUpscale", "Ours"]
+
+g = sns.catplot(df.filter(pl.col('facet').eq('Image Size'), pl.col('Method').ne('OpenCV SIFT')), kind='bar', x='resolution', y='time', hue='Method', hue_order=order)
 g.ax.set_title('Detection Time by Image Size')
 g.ax.set(xlabel='Image Size', ylabel='Time (ms)')
 for ax in g.axes.flatten():
     for c in ax.containers:
         ax.bar_label(c, label_type='edge', fmt='{:.1f}')
 
+inset_rect = [0.77, 0.7, 0.25, 0.25]
+
+inset_ax = g.figure.add_axes(inset_rect)
+sns.barplot(
+    data=df.filter(pl.col('facet').eq('Image Size')),
+    x="resolution",
+    y="time",
+    hue="Method",
+    ax=inset_ax,
+    legend=False,
+    hue_order=order
+)
+inset_ax.set_xlabel('')
+inset_ax.set_ylabel('')
+inset_ax.tick_params(axis='both', which='major', labelsize=6)
+
 g.savefig(out_dir / "image_size.svg")
 
-g = sns.catplot(df.filter(pl.col('facet').eq('Feature Count')), kind='bar', x='max_features', y='time', hue='Method')
+
+
+
+
+g = sns.catplot(df.filter(pl.col('facet').eq('Feature Count'), pl.col('Method').ne('OpenCV SIFT')), kind='bar', x='max_features', y='time', hue='Method', hue_order=order)
 g.ax.set_title('Detection Time by Feature Count (4096x3072 image)')
 g.ax.set(xlabel='Feature Count ', ylabel='Time (ms)')
 for ax in g.axes.flatten():
     for c in ax.containers:
         ax.bar_label(c, label_type='edge', fmt='{:.1f}')
+inset_ax = g.figure.add_axes(inset_rect)
+sns.barplot(
+    data=df.filter(pl.col('facet').eq('Feature Count')),
+    x="max_features",
+    y="time",
+    hue="Method",
+    ax=inset_ax,
+    legend=False,
+    hue_order=order
+)
+inset_ax.set_xlabel('')
+inset_ax.set_ylabel('')
+inset_ax.tick_params(axis='both', which='major', labelsize=6)
 g.savefig(out_dir / "feature_count.svg")
