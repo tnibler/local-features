@@ -66,6 +66,7 @@ pub struct BuildTimeParams {
     /// Exponent, so 1 means downsampling by a factor of 2
     pub keypoint_orientation_patch_subsample: u32,
     pub debug_readout_patches: bool,
+    pub debug_readout_coarse: bool,
 }
 
 impl Default for BuildTimeParams {
@@ -79,6 +80,7 @@ impl Default for BuildTimeParams {
             pca: MKDPCA::LIBERTY,
             keypoint_orientation_patch_subsample: 0,
             debug_readout_patches: false,
+            debug_readout_coarse: false,
         }
     }
 }

@@ -109,10 +109,14 @@ void main() {
         if (valid_px) {
             const float sample_x = (x_img + 0.5) / float(texture_size.x);
             const float sample_y = (y_img + 0.5) / float(texture_size.y);
-            my_samples[i] = textureLod(
-                sampler2D(TEXTURE_PATCH_PYR, SAMPLER_NN),
-                vec2(sample_x, sample_y),
-                layer
+            // my_samples[i] = textureLod(
+            //     sampler2D(TEXTURE_PATCH_PYR, SAMPLER_NN),
+            //     vec2(sample_x, sample_y),
+            //     layer
+            // ).r;
+            my_samples[i] = texture(
+                sampler2DArray(texture_coarse, SAMPLER_NN),
+                vec3(sample_x, sample_y, layer)
             ).r;
         } else {
             my_samples[i] = -1.0;

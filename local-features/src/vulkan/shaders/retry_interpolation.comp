@@ -1,0 +1,210 @@
+#version 460
+#include "extensions.glsl"
+#include "common.glsl"
+
+const uint WG_SIZE = 32;
+// 9 samples * 3 scales
+layout(local_size_x = WG_SIZE) in;
+
+layout(push_constant) uniform ScanExtremaPc2 {
+    ExtremumLocations extremum_locations;
+    uint border;
+    float contrast_threshold;
+    float edgeness_cm_low;
+    float edgeness_cm_high;
+    uint skip_layers;
+    float min_scale;
+
+    uint width;
+    uint height;
+    uint max_extrema;
+
+    uint n_fine_levels;
+};
+
+int x;
+int y;
+int z;
+int loaded_x;
+int loaded_y;
+int loaded_z;
+
+const int QUADS_WIDTH = 3;
+
+// need 4 blurred layers for 3 DoG layers
+shared float sh_buf[4][QUADS_WIDTH * QUADS_WIDTH * 4];
+
+// The extremum we're concerned with is at this location the sh_buf
+const ivec2 PIXEL_BIAS = ivec2(2, 2);
+
+float at(int zz, int yy, int xx) {
+    ASSERT(0 <= zz);
+    ASSERT(zz < n_fine_levels);
+    ASSERT(0 <= xx);
+    ASSERT(0 <= yy);
+    ASSERT(xx < width);
+    ASSERT(yy < height);
+    // const float ref = imageLoad(image_coarse, ivec3(xx, yy, zz)).r -
+    //     imageLoad(image_coarse, ivec3(xx, yy, zz + 1)).r;
+
+    ASSERT(zz - loaded_z >= -1);
+    ASSERT(zz - loaded_z <= 1);
+    const float have = sh_buf[zz - loaded_z + 1][(yy - loaded_y + PIXEL_BIAS.y) * QUADS_WIDTH * 2 + (xx - loaded_x + PIXEL_BIAS.x)];
+    return have;
+}
+
+bool within(int m, int lo, int hi) {
+    return lo <= m && m < hi;
+}
+
+// can point at (xx, yy, zz) be interpolated with the samples currently in the shared buffer
+bool in_shbuf_bounds(int xx, int yy, int zz) {
+    return zz == loaded_z 
+    && within(xx - loaded_x + PIXEL_BIAS.x, 1, 2 * QUADS_WIDTH - 1)
+    && within(yy - loaded_y + PIXEL_BIAS.y, 1, 2 * QUADS_WIDTH - 1);
+}
+
+bool in_bounds(int xx, int yy, int zz) {
+    return border <= xx && xx < width - border 
+    && border <= yy && yy < height - border 
+    && 0 < zz && zz < n_fine_levels - 1;
+}
+
+void load_dog_to_buf() {
+    loaded_x = x;
+    loaded_y = y;
+    loaded_z = z;
+    const vec3 texture_size = textureSize(texture_coarse, 0);
+    for (uint i = gl_LocalInvocationIndex; i < 4 * QUADS_WIDTH * QUADS_WIDTH; i += WG_SIZE) {
+        const int layer = int(i) / (QUADS_WIDTH * QUADS_WIDTH);
+        const int quad_in_layer = int(i) % (QUADS_WIDTH * QUADS_WIDTH);
+        const int qy = quad_in_layer / QUADS_WIDTH;
+        const int qx = quad_in_layer % QUADS_WIDTH;
+        const vec3 coords = vec3(
+            float(loaded_x - PIXEL_BIAS.x + 2 * qx + 1) / texture_size.x,
+            float(loaded_y - PIXEL_BIAS.y + 2 * qy + 1) / texture_size.y,
+            float(loaded_z + layer - 1)
+        );
+        // bl br tr tl
+        const vec4 quad = textureGather(sampler2DArray(texture_coarse, SAMPLER_BIL), coords);
+        sh_buf[layer][(2 * qy + 0) * 2 * QUADS_WIDTH + 2 * qx + 0] = quad[3];
+        sh_buf[layer][(2 * qy + 0) * 2 * QUADS_WIDTH + 2 * qx + 1] = quad[2];
+        sh_buf[layer][(2 * qy + 1) * 2 * QUADS_WIDTH + 2 * qx + 1] = quad[1];
+        sh_buf[layer][(2 * qy + 1) * 2 * QUADS_WIDTH + 2 * qx + 0] = quad[0];
+    }
+    barrier();
+    for (uint i = gl_LocalInvocationIndex; i < 3 * QUADS_WIDTH * QUADS_WIDTH * 4; i += WG_SIZE) {
+        const int layer = int(i) / (QUADS_WIDTH * QUADS_WIDTH * 4);
+        const int in_layer = int(i) % (QUADS_WIDTH * QUADS_WIDTH * 4);
+        const float dog = sh_buf[layer][in_layer] - sh_buf[layer + 1][in_layer];
+        barrier();
+        sh_buf[layer][in_layer] = dog;
+    }
+    barrier();
+}
+
+// NOTE:before changing anything here please consolidate copy pasted scan_extrema and retry_interpolation
+void main() {
+    const uint extremum_idx = gl_WorkGroupID.x;
+    if (extremum_idx >= min(extremum_locations.n_retry_extrema, MAX_RETRY_EXTREMA)) {
+        return;
+    }
+    x = int(get_retry_extremum_x(extremum_locations, extremum_idx));
+    y = int(get_retry_extremum_y(extremum_locations, extremum_idx));
+    z = int(get_retry_extremum_scale(extremum_locations, extremum_idx));
+    ASSERT(in_bounds(x, y, z));
+    load_dog_to_buf();
+
+    for (int i = 0; i < 5; i++) {
+        const float dds = (at(z+1, y, x) - at(z-1, y, x)) / 2.0;
+        const float ddy = (at(z, y+1, x) - at(z, y-1, x)) / 2.0;
+        const float ddx = (at(z, y, x+1) - at(z, y, x-1)) / 2.0;
+
+        const float value2x = at(z, y, x) * 2.0;
+        // d2/ds2
+        const float h11 = at(z+1, y, x) + at(z-1, y, x) - value2x;
+        // d2/dy2
+        const float h22 = at(z, y+1, x) + at(z, y-1, x) - value2x;
+        // d2/dx2
+        const float h33 = at(z, y, x+1) + at(z, y, x-1) - value2x;
+        // d2/dyds
+        const float h12 = (at(z+1, y+1, x) - at(z-1, y+1, x) - at(z+1, y-1, x) + at(z-1, y-1, x)) / 4.0;
+        // d2/dxds
+        const float h13 = (at(z+1, y, x+1) - at(z-1, y, x+1) - at(z+1, y, x-1) + at(z-1, y, x-1)) / 4.0;
+        // d2/dxdy
+        const float h23 = (at(z, y+1, x+1) - at(z, y+1, x-1) - at(z, y-1, x+1) + at(z, y-1, x-1)) / 4.0;
+
+        const float det = h11 * h22 * h33 - h11 * h23 * h23 - h12 * h12 * h33 + 2. * h12 * h13 * h23
+            - h13 * h13 * h22;
+        const float hinv11 = (h22 * h33 - h23 * h23) / det;
+        const float hinv12 = (h13 * h23 - h12 * h33) / det;
+        const float hinv13 = (h12 * h23 - h13 * h22) / det;
+        const float hinv22 = (h11 * h33 - h13 * h13) / det;
+        const float hinv23 = (h12 * h13 - h11 * h23) / det;
+        const float hinv33 = (h11 * h22 - h12 * h12) / det;
+
+        const float offset_scale = -(hinv11 * dds + hinv12 * ddy + hinv13 * ddx);
+        const float offset_y     = -(hinv12 * dds + hinv22 * ddy + hinv23 * ddx);
+        const float offset_x     = -(hinv13 * dds + hinv23 * ddy + hinv33 * ddx);
+        if (det == 0) {
+            return;
+        }
+
+        const float denom = (h22 + h33) * (h22 + h33);
+        const float cm = 1 - 4 * (h22 * h33 - h23 * h23) / denom;
+
+        const float allowed_offset = 0.55;
+
+        if (abs(offset_x) > allowed_offset || abs(offset_y) > allowed_offset || abs(offset_scale) > allowed_offset) {
+            x = int(round(x + offset_x));
+            y = int(round(y + offset_y));
+            z = int(round(z + offset_scale));
+            if (!in_bounds(x, y, z)) {
+                return;
+            }
+            if (!in_shbuf_bounds(x, y, z)) {
+                load_dog_to_buf();
+                continue;
+            }
+            continue;
+        } 
+
+        const float extremum_x = float(x) + offset_x;
+        const float extremum_y = float(y) + offset_y;
+        if (extremum_x < border || extremum_x >= width - border
+            || extremum_y < border || extremum_y >= height - border) {
+            return;
+        }
+
+        const float interp_value = offset_scale * dds + offset_y * ddy + offset_x * ddx;
+
+        const float contrast = abs(at(z, y, x) + interp_value / 2.0);
+        // This contrast can't be lower than the threshold here, since interpolating the extremum position
+        // only increases the DoG response. 
+        // You could have two thresholds though, one pre- and one post-interpolation if that's ever desired.
+        if (contrast < contrast_threshold) {
+            return;
+        }
+
+        // Check extremum edgeness  with hessian anisotropy criterion
+        if ( (edgeness_cm_low <= cm && cm <= edgeness_cm_high)) {
+            return;
+        }
+
+        float size = DOG_FIRST_SCALE_SIGMA * DOG_SIGMA_RADIUS_FACTOR * pow(2.0, float(z) + offset_scale);
+        if (size < min_scale) {
+            return;
+        }
+
+        if (gl_LocalInvocationIndex == 0) {
+            const uint idx = atomicAdd(extremum_locations.n_extrema, 1);
+            if (idx < max_extrema) {
+                set_extremum_x_float(extremum_locations, idx, extremum_x);
+                set_extremum_y_float(extremum_locations, idx, extremum_y);
+                set_extremum_scale_float(extremum_locations, idx, size);
+                set_extremum_contrast(extremum_locations, idx, contrast_threshold);
+            }
+        }
+        return;
+    }
+}

@@ -6,7 +6,7 @@
 #include "bindings.glsl"
 
 #ifdef ENABLE_ASSERTIONS
-#define ASSERT(expr) ( expr || (printf("Assertion failed: %s:%d\n", __FILE__, __LINE__), false) )
+#define ASSERT(expr) ( expr || (printf("Assertion failed: %d\n", __LINE__), false) )
 #else 
 #define ASSERT(expr) 
 #endif
@@ -15,7 +15,7 @@ const float PI = 3.1415926538;
 
 // detected blob radius = sqrt(2) * sigma_LoG = sqrt(2) * ratio * sigma_DoG * sqrt(log(ratio) / (ratio^2 - 1)) $, where ratio = 2, sigma_DoG = 0.6 (first blur, before SWT)
 // = 0.8157, but 0.82 works a bit better with all other constants in e.g., keypoint_orientation
-const float DOG_FIRST_SCALE_SIGMA = 0.82;
+const float DOG_FIRST_SCALE_SIGMA = 0.813;
 // Blob radius = sqrt(2) * sigma_LoG
 const float DOG_SIGMA_RADIUS_FACTOR = sqrt(2.0);
 
@@ -52,12 +52,16 @@ layout(buffer_reference, std430, buffer_reference_align=4) buffer ExtremumLocati
     // simple attempt to keep atomic counters on their own cache line. Not verified
     uint _pad[15];
 
+    uint n_retry_extrema;
+
+    uint _pad2[15];
+
     // size: 4 * MAX_EXTREMA
     uint data[];
 };
 
+const uint N_COORDS = 4; // x, y, scale, contrast
 uint _coord_idx(uint extremum_idx, uint coord) {
-    const uint N_COORDS = 4;
     return (extremum_idx / EXTREMUM_BLOCK_LEN) * N_COORDS * EXTREMUM_BLOCK_LEN + coord * EXTREMUM_BLOCK_LEN + extremum_idx % EXTREMUM_BLOCK_LEN;
 }
 
@@ -81,6 +85,14 @@ void set_extremum_scale_float(ExtremumLocations buf, uint i, float s) { buf.data
 
 float get_extremum_contrast(ExtremumLocations buf, uint i)  { return uintBitsToFloat(buf.data[_coord_idx(i, 3)]); }
 void set_extremum_contrast(ExtremumLocations buf, uint i, float c) { buf.data[_coord_idx(i, 3)] = floatBitsToUint(c); }
+
+uint get_retry_extremum_x(ExtremumLocations buf, uint i)             { return buf.data[N_COORDS * MAX_EXTREMA                         + i]; }
+uint get_retry_extremum_y(ExtremumLocations buf, uint i)             { return buf.data[N_COORDS * MAX_EXTREMA + 1 * MAX_RETRY_EXTREMA + i]; }
+uint get_retry_extremum_scale(ExtremumLocations buf, uint i)         { return buf.data[N_COORDS * MAX_EXTREMA + 2 * MAX_RETRY_EXTREMA + i]; }
+void set_retry_extremum_x(ExtremumLocations buf, uint i, uint x)     { buf.data[N_COORDS * MAX_EXTREMA                         + i] = x; }
+void set_retry_extremum_y(ExtremumLocations buf, uint i, uint y)     { buf.data[N_COORDS * MAX_EXTREMA + 1 * MAX_RETRY_EXTREMA + i] = y; }
+void set_retry_extremum_scale(ExtremumLocations buf, uint i, uint s) { buf.data[N_COORDS * MAX_EXTREMA + 2 * MAX_RETRY_EXTREMA + i] = s; }
+
 
 // Written by host
 layout(buffer_reference, std430, buffer_reference_align=4) readonly buffer FilteredExtrema {
@@ -153,7 +165,4 @@ layout(buffer_reference, std430, buffer_reference_align=4) buffer Vec4Buf {
     vec4 data[];
 };
 
-layout(buffer_reference, std430, buffer_reference_align=4) buffer FloatBuf {
-    float data[];
-};
 #endif // _COMMON_GLSL

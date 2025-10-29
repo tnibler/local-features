@@ -25,12 +25,15 @@ layout(push_constant) uniform ScanExtremaPc {
     uint n_fine_levels;
 };
 
+const uint MAX_INTERPOLATION_ITERS = 5;
+
 const uint SCAN_AREA = 2 * (SLICE_SIZE_HALF + 2) - 2;
 
 const uint RINGBUF_LAYERS = 3;
 int layer_rb_idx;
 int rb_center_layer;
 
+// Bad name, it's actually the side length of the area scanned for extrema (excluding the halo ring)
 const uint BUFFER_SIZE = 2 * int(SLICE_SIZE_HALF + 2);
 shared float sh_dog_ringbuf[RINGBUF_LAYERS][BUFFER_SIZE * BUFFER_SIZE];
 
@@ -45,6 +48,7 @@ shared float sh_extremum_x[max_wg_extrema];
 shared float sh_extremum_y[max_wg_extrema];
 shared float sh_extremum_scale[max_wg_extrema];
 shared float sh_extremum_contrast[max_wg_extrema];
+
 
 ivec3 wg_coords = (ivec3(gl_WorkGroupID) * ivec3(SCAN_AREA, SCAN_AREA, 1) 
     + ivec3(border, border, skip_layers));
@@ -111,6 +115,7 @@ bool is_extremum(const int x, const int y, const int z) {
     return a;
 }
 
+// NOTE:before changing anything here please consolidate copy pasted scan_extrema and retry_interpolation
 void check_extremum(int x, int y, int fine_scale) {
     int z = 0;
     const int abs_x = x + wg_coords.x;
@@ -118,7 +123,10 @@ void check_extremum(int x, int y, int fine_scale) {
     if (abs_x >= width - border || abs_y >= height - border) {
         return;
     }
-    if (is_extremum(x, y, z)) {
+    if (!is_extremum(x, y, z)) {
+        return;
+    }
+    for (int i = 0; i < MAX_INTERPOLATION_ITERS; i++) {
         const float dds = (at(z+1, y, x) - at(z-1, y, x)) / 2.0;
         const float ddy = (at(z, y+1, x) - at(z, y-1, x)) / 2.0;
         const float ddx = (at(z, y, x+1) - at(z, y, x-1)) / 2.0;
@@ -155,12 +163,35 @@ void check_extremum(int x, int y, int fine_scale) {
         const float denom = (h22 + h33) * (h22 + h33);
         const float cm = 1 - 4 * (h22 * h33 - h23 * h23) / denom;
 
-        if (abs(offset_x) > 0.5 || abs(offset_y) > 0.5 || abs(offset_scale) > 0.5) {
-            // x = int(round(x + offset_x));
-            // y = int(round(y + offset_y));
-            // z = int(round(z + offset_scale));
-            // TODO: if we have those pixels try interpolating again. especially at larger scales you lose feature here
-            return;
+        const float allowed_offset = 0.55;
+
+        bool different_scale = (abs(offset_scale) >= allowed_offset);
+        if (different_scale || abs(offset_x) > allowed_offset || abs(offset_y) > allowed_offset) {
+            x = int(round(x + offset_x));
+            y = int(round(y + offset_y));
+            z = int(round(z + offset_scale));
+            if (different_scale || x < 0 || x >= BUFFER_SIZE - 2 || y < 0 || y >= BUFFER_SIZE - 2) {
+                // we don't have the samples required to continue interpolation, save this extremum to retry in the next stage
+                const int global_x = wg_coords.x + x;
+                const int global_y = wg_coords.y + y;
+                const int global_scale = fine_scale + z;
+                const int bborder = max(1, int(border));
+                const bool in_bounds = bborder <= global_x && global_x < width - bborder
+                    && bborder <= global_y && global_y < height - bborder
+                    && 0 < global_scale && global_scale < n_fine_levels - 1;
+                if (in_bounds) {
+                    const uint retry_idx = atomicAdd(extremum_locations.n_retry_extrema, 1);
+                    if (retry_idx < MAX_RETRY_EXTREMA) {
+                        set_retry_extremum_x(extremum_locations, retry_idx, global_x);
+                        set_retry_extremum_y(extremum_locations, retry_idx, global_y);
+                        set_retry_extremum_scale(extremum_locations, retry_idx, global_scale);
+                    }
+                }
+                return;
+            } else {
+                // try interpolation again
+                continue;
+            }
         } 
 
         const float extremum_x = float(wg_coords.x + x) + offset_x;
@@ -176,9 +207,9 @@ void check_extremum(int x, int y, int fine_scale) {
         // This contrast can't be lower than the threshold here, since interpolating the extremum position
         // only increases the DoG response. 
         // You could have two thresholds though, one pre- and one post-interpolation if that's ever desired.
-        // if (contrast < contrast_threshold) {
-        //     return;
-        // }
+        if (contrast < contrast_threshold) {
+            return;
+        }
 
         // Check extremum edgeness  with hessian anisotropy criterion
         if (denom == 0 || (edgeness_cm_low <= cm && cm <= edgeness_cm_high)) {
@@ -186,9 +217,14 @@ void check_extremum(int x, int y, int fine_scale) {
         }
 
         // SIFT edge rejection. Also works 
-        // const float edgeness = (h22 + h33) * (h22 + h33) / ((h22 * h33) - (h12 * h23));
-        // if (edgeness > 14.0) {
-        //     return;
+        // {
+        //     const float tr = h22 + h33;
+        //     const float det = (h22 * h33) - (h12 * h23);
+        //     // tr*tr*edgeThreshold >= (edgeThreshold + 1)*(edgeThreshold + 1)*det
+        //     const float thresh = edgeness_cm_low;
+        //     if (det <= 0 || tr * tr * thresh >= (thresh + 1) * (thresh + 1) * det) {
+        //         return;
+        //     }
         // }
 
         float size = DOG_FIRST_SCALE_SIGMA * DOG_SIGMA_RADIUS_FACTOR * pow(2.0, float(z) + fine_scale + offset_scale);
@@ -202,6 +238,7 @@ void check_extremum(int x, int y, int fine_scale) {
             sh_extremum_y[extremum_idx] = extremum_y;
             sh_extremum_scale[extremum_idx] = size;
             sh_extremum_contrast[extremum_idx] = contrast;
+            return;
         }
     }
 }
@@ -236,7 +273,7 @@ uint abs_argmax(vec4 v) {
     int m = 5;
     float cur = 0;
     for (int i = 0; i < 4; i++) {
-        if (abs(v[i]) > max(abs(cur), contrast_threshold)) {
+        if (abs(v[i]) > max(abs(cur), /* 0.5 * */ contrast_threshold)) {
             cur = v[i];
             m = i;
         }

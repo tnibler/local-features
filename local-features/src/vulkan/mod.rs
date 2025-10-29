@@ -23,7 +23,10 @@ use vulkano::{
 };
 use vulkano_taskgraph::{
     Id, QueueFamilyType, TaskContext,
-    command_buffer::{BufferMemoryBarrier, CopyBufferInfo, DependencyInfo, RecordingCommandBuffer},
+    command_buffer::{
+        BufferImageCopy, BufferMemoryBarrier, CopyBufferInfo, CopyImageToBufferInfo, DependencyInfo,
+        RecordingCommandBuffer,
+    },
     graph::{CompileInfo, ExecutableTaskGraph, NodeId, ResourceMap, TaskGraph},
     resource::{AccessTypes, Flight, HostAccessType, ImageLayoutType, Resources, ResourcesCreateInfo},
     resource_map,
@@ -92,6 +95,7 @@ pub struct LocalFeaturesVulkan {
     extract_standalone: CompiledTaskGraph,
     detect_extract_all: CompiledTaskGraph,
     flight_id: Id<Flight>,
+    user_params: BuildTimeParams,
 
     // not fully sorted out, if ever multiple flights are allowed each flight needs these
     candidate_blobs_readback: IndexVec<FilteredExtremumIdx, CandidateBlob>,
@@ -126,6 +130,7 @@ struct FixedParams {
     pub n_scales: u32,
     pub max_extrema: u32,
     pub max_keypoints: u32,
+    pub max_retry_extrema: u32,
     pub pca: MKDPCA,
     /// Extremum coordinates in the buffer are grouped into blocks, such that the layout within
     /// a block is e.g., [xs.., ys.., zs..] to limit how much empty buffer is copied around.
@@ -133,6 +138,7 @@ struct FixedParams {
 
     pub patch_pyr_levels: u32,
     pub debug_readout_patches: bool,
+    pub debug_readout_coarse: bool,
 }
 
 #[derive(Clone)]
@@ -199,6 +205,7 @@ struct GlobalContext {
     input_image: *const [f32],
     border: u32,
     rt_max_extrema: u32,
+    rt_max_retry_extrema: u32,
     rt_max_keypoints: u32,
     image_width: u32,
     image_height: u32,
@@ -255,10 +262,12 @@ impl LocalFeaturesVulkan {
             n_scales: params.n_scales,
             max_extrema: block_len * params.max_blobs.div_ceil(block_len),
             max_keypoints: params.max_features,
+            max_retry_extrema: params.max_blobs / 100,
             patch_pyr_levels,
             extremum_block_len: block_len,
             pca: params.pca,
             debug_readout_patches: params.debug_readout_patches,
+            debug_readout_coarse: params.debug_readout_coarse,
         };
 
         let buffer_layouts = BufferLayouts {
@@ -402,6 +411,7 @@ impl LocalFeaturesVulkan {
             extract_standalone,
             detect_extract_all,
             physical_resources,
+            user_params: params,
             flight_id,
             candidate_blobs_readback: IndexVec::new(),
             extremum_idxs: Default::default(),
@@ -720,6 +730,74 @@ impl LocalFeaturesVulkan {
         Ok(Array3::from_shape_vec((self.fixed_params.max_keypoints as usize, 32, 32), data).expect("shape is correct"))
     }
 
+    pub fn debug_read_coarse_images(&mut self) -> Result<Array3<f32>, VulkanError> {
+        assert!(
+            self.fixed_params.debug_readout_coarse,
+            "Instance must have been created with debug_readout_coarse set"
+        );
+        let p = &self.fixed_params;
+        let imgs_len =
+            p.max_image_width as usize * p.max_image_height as usize * (self.fixed_params.n_scales + 3) as usize;
+        let mut data: Vec<f32> = Vec::new();
+        let buf_staging_debug = self.physical_resources.ids.buf_staging_debug.expect("must be Some");
+        unsafe {
+            vulkano_taskgraph::execute(
+                &self.vk.queue,
+                &self.resources,
+                self.flight_id,
+                |cbf, tcx| {
+                    cbf.copy_image_to_buffer(&CopyImageToBufferInfo {
+                        src_image: self.physical_resources.ids.img_coarse,
+                        src_image_layout: ImageLayoutType::General,
+                        dst_buffer: buf_staging_debug,
+                        regions: &[BufferImageCopy {
+                            image_extent: [p.max_image_width, p.max_image_height, p.n_scales + 3],
+                            image_subresource: tcx
+                                .image(self.physical_resources.ids.img_coarse)?
+                                .image()
+                                .subresource_layers(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })?;
+                    Ok(())
+                },
+                [],
+                [(buf_staging_debug, AccessTypes::COPY_TRANSFER_WRITE)],
+                [(self.physical_resources.ids.img_coarse, AccessTypes::COPY_TRANSFER_READ, ImageLayoutType::General)],
+            )
+            .expect("TODO");
+        }
+        self.resources.flight(self.flight_id).unwrap().wait(None)?;
+        unsafe {
+            vulkano_taskgraph::execute(
+                &self.vk.queue,
+                &self.resources,
+                self.flight_id,
+                |_cbf, tcx| {
+                    let copy_size = imgs_len as u64 * size_of::<f32>() as u64;
+                    let buf: &[f32] = tcx.read_buffer(buf_staging_debug, ..copy_size)?;
+                    data.extend(buf);
+                    Ok(())
+                },
+                [(buf_staging_debug, HostAccessType::Read)],
+                [],
+                [],
+            )
+            .expect("TODO");
+        }
+        self.resources.flight(self.flight_id).unwrap().wait(None)?;
+        Ok(Array3::from_shape_vec(
+            (p.n_scales as usize + 3, p.max_image_height as usize, p.max_image_width as usize),
+            data,
+        )
+        .expect("shape is correct"))
+    }
+
+    pub fn params(&self) -> &BuildTimeParams {
+        &self.user_params
+    }
+
     fn do_extremum_readback(
         &mut self,
         global_context: &mut GlobalContext,
@@ -808,6 +886,7 @@ impl LocalFeaturesVulkan {
         let height: u32 = img.nrows().try_into().expect("TODO");
         let rt_patch_pyr_levels = f32::min(width as f32, height as f32).log2().ceil().round() as u32;
         let rt_max_extrema = self.fixed_params.max_extrema;
+        let rt_max_retry_extrema = self.fixed_params.max_retry_extrema;
         let rt_max_keypoints = self.fixed_params.max_keypoints;
         let img_bytes = match self.fixed_params.precision {
             Precision::Float32 => unsafe { std::slice::from_raw_parts(img.as_ptr() as *const _, img.len()) },
@@ -832,6 +911,7 @@ impl LocalFeaturesVulkan {
             // TODO: check if extremum scan works with border
             border: 0,
             rt_max_extrema,
+            rt_max_retry_extrema,
             rt_max_keypoints,
             rt_patch_pyr_levels,
             patch_scale_factor: params.patch_scale_factor,
@@ -925,15 +1005,24 @@ fn allocate_buffers(
             layout,
         )?
     };
-    let buf_staging_debug = if params.debug_readout_patches {
-        let patches_len = u64::from(params.max_keypoints) * 32 * 32;
+    let buf_staging_debug = if params.debug_readout_patches || params.debug_readout_coarse {
+        let patches_len = if params.debug_readout_patches {
+            u64::from(params.max_keypoints) * 32 * 32
+        } else {
+            0
+        };
+        let coarse_len = if params.debug_readout_coarse {
+            u64::from(params.max_image_width * params.max_image_height * (params.n_scales + 3)) * 4
+        } else {
+            0
+        };
         let buf = resources.create_buffer(
             &BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST, ..Default::default() },
             &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::HOST_RANDOM_ACCESS | MemoryTypeFilter::PREFER_HOST,
                 ..Default::default()
             },
-            DeviceLayout::new_unsized::<[f32]>(patches_len).expect("is valid buffer size"),
+            DeviceLayout::new_unsized::<[f32]>(patches_len.max(coarse_len)).expect("is valid buffer size"),
         )?;
         Some(buf)
     } else {
@@ -1189,7 +1278,7 @@ fn build_detect_taskgraph(
     let buffers_to_zero = Vec::from([
         (
             virtual_ids.buf_extremum_locations,
-            (buffer_layouts.extremum_locations.offset_n_extrema + size_of::<u32>()) as u64,
+            (buffer_layouts.extremum_locations.offset_n_retry_extrema + size_of::<u32>()) as u64,
         ),
         (virtual_ids.buf_keypoints, (buffer_layouts.keypoints.offset_extremum_indices + size_of::<u32>()) as u64),
     ]);
@@ -1297,7 +1386,7 @@ fn build_detect_taskgraph(
                         pipeline: pipelines.swt_dense.clone(),
                         direction: BlurDirection::Vertical,
                         do_bind_pipeline: false,
-                        // cv above: here we're not overwriting level 0
+                        // see above: here we're not overwriting level 0
                         in_out_level: 1,
                     },
                 )
@@ -1369,7 +1458,7 @@ fn build_detect_taskgraph(
                 vimg_dst: virtual_ids.img_patch_pyr,
                 // Just decimating level 0 (blurred with sigma=0.6) to pyramid level 1 at half
                 // scale also works pretty well.
-                src_array_layer: 1,
+                src_array_layer: 0,
                 dst_mip_level: 1,
                 half_size: true,
             },
@@ -1391,6 +1480,7 @@ fn build_detect_taskgraph(
     // Wait until all blurring is done so we don't switch/rebind pipelines every time,
     // since the pyramid involves a blur compute stage
     taskgraph.add_edge(last_swt_node, pyr_start_node_id).unwrap();
+    taskgraph.add_edge(copy_scale_1_to_patch_pyr, pyr_start_node_id).unwrap();
 
     let scan_extrema_node_id = taskgraph
         .create_task_node(
@@ -1403,13 +1493,29 @@ fn build_detect_taskgraph(
             },
         )
         .image_access(virtual_ids.img_coarse, AccessTypes::COMPUTE_SHADER_SAMPLED_READ, ImageLayoutType::General)
-        .image_access(virtual_ids.img_coarse, AccessTypes::COMPUTE_SHADER_STORAGE_WRITE, ImageLayoutType::General)
         .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COMPUTE_SHADER_STORAGE_READ)
         .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COMPUTE_SHADER_STORAGE_WRITE)
         .build();
 
     // Wait for pyramid blur shaders
     taskgraph.add_edge(pyr_end_node_id, scan_extrema_node_id).unwrap();
+
+    let retry_interpolation_node_id = taskgraph
+        .create_task_node(
+            "retry interpolation",
+            QueueFamilyType::Compute,
+            RetryInterpolationTask {
+                pipeline: pipelines.retry_interpolation.clone(),
+                n_fine_scales: n_coarse_levels - 1,
+                vbuf_extremum_locations: virtual_ids.buf_extremum_locations,
+            },
+        )
+        .image_access(virtual_ids.img_coarse, AccessTypes::COMPUTE_SHADER_SAMPLED_READ, ImageLayoutType::General)
+        .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COMPUTE_SHADER_STORAGE_READ)
+        .buffer_access(virtual_ids.buf_extremum_locations, AccessTypes::COMPUTE_SHADER_STORAGE_WRITE)
+        .build();
+
+    taskgraph.add_edge(scan_extrema_node_id, retry_interpolation_node_id).unwrap();
 
     Ok(scan_extrema_node_id)
 }
@@ -1721,7 +1827,8 @@ fn make_virtual_ids<W>(taskgraph: &mut TaskGraph<W>, params: &FixedParams) -> Bu
         buf_extremum_locations: taskgraph.add_buffer(&BufferCreateInfo::default()),
         buf_keypoints: taskgraph.add_buffer(&BufferCreateInfo::default()),
         buf_filtered_extrema: taskgraph.add_buffer(&BufferCreateInfo::default()),
-        buf_staging_debug: params.debug_readout_patches.then(|| taskgraph.add_buffer(&BufferCreateInfo::default())),
+        buf_staging_debug: (params.debug_readout_patches || params.debug_readout_coarse)
+            .then(|| taskgraph.add_buffer(&BufferCreateInfo::default())),
         img_coarse: taskgraph.add_image(&ImageCreateInfo::default()),
         img_scratch: taskgraph.add_image(&ImageCreateInfo::default()),
         img_patch_pyr: taskgraph.add_image(&ImageCreateInfo::default()),
@@ -1789,7 +1896,7 @@ fn detect_nofiltering_same_as_all_noop_filter() {
 
     let mut lf = LocalFeaturesVulkan::new(
         BuildTimeParams {
-            n_scales: 5,
+            n_scales: 6,
             max_image_width: img.width(),
             max_image_height: img.height(),
             max_features: 5000,

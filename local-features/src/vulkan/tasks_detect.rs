@@ -288,3 +288,49 @@ impl Task for ScanExtremaTask {
         Ok(())
     }
 }
+
+pub(super) struct RetryInterpolationTask {
+    pub n_fine_scales: u32,
+    pub vbuf_extremum_locations: Id<Buffer>,
+    pub pipeline: Arc<ComputePipeline>,
+}
+
+impl Task for RetryInterpolationTask {
+    type World = GlobalContext;
+    unsafe fn execute(
+        &self,
+        cbf: &mut RecordingCommandBuffer<'_>,
+        tcx: &mut TaskContext<'_>,
+        world: &Self::World,
+    ) -> TaskResult {
+        let addr = |id: Id<Buffer>| Ok::<_, vulkano_taskgraph::TaskError>(tcx.buffer(id)?.buffer().device_address()?);
+        unsafe {
+            cbf.bind_pipeline_compute(&self.pipeline)?;
+            cbf.push_constants(
+                self.pipeline.layout(),
+                0,
+                &shaders::shaders_f32::ScanExtremaPc {
+                    extremum_locations: addr(self.vbuf_extremum_locations)?.into(),
+                    width: world.image_width,
+                    height: world.image_height,
+                    n_fine_levels: self.n_fine_scales,
+                    border: world.border,
+                    contrast_threshold: world.contrast_threshold,
+                    min_scale: world.extremum_min_scale,
+                    edgeness_cm_low: world.edgeness_cm_low,
+                    edgeness_cm_high: world.edgeness_cm_high,
+                    // TODO: unused. If min_scale implies that all extrema below a certain layer
+                    // get filtered, no need to even process it.
+                    skip_layers: world.extremum_skip_layers,
+                    max_extrema: world.rt_max_extrema,
+                },
+            )?;
+        }
+        let wg_count = [world.rt_max_retry_extrema, 1, 1];
+        trace!("Retry Interpolation: dispatch {:?}", wg_count);
+        unsafe {
+            cbf.dispatch(wg_count)?;
+        }
+        Ok(())
+    }
+}

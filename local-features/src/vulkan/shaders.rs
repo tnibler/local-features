@@ -48,6 +48,10 @@ pub mod shaders_f32 {
                 ty: "compute",
                 path: "src/vulkan/shaders/scan_extrema.comp",
             },
+            retry_interpolation: {
+                ty: "compute",
+                path: "src/vulkan/shaders/retry_interpolation.comp",
+            },
             blur_pyramid: {
                 ty: "compute",
                 path: "src/vulkan/shaders/blur_pyramid.comp",
@@ -93,6 +97,7 @@ pub struct ComputePipelines {
     pub swt_sparse2: Arc<ComputePipeline>,
     pub swt_dense: Arc<ComputePipeline>,
     pub scan_extrema: Arc<ComputePipeline>,
+    pub retry_interpolation: Arc<ComputePipeline>,
     pub blur_pyramid: Arc<ComputePipeline>,
     pub keypoint_orientation: Arc<ComputePipeline>,
     pub patch_gradients: Arc<ComputePipeline>,
@@ -107,16 +112,19 @@ pub struct ComputePipelines {
 
 pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipelines, crate::vulkan::VulkanError> {
     let min_subgroup_size = vk.device.physical_device().properties().min_subgroup_size.expect("TODO what now");
+    assert_eq!(params.max_extrema % params.extremum_block_len, 0);
     let specialization_constants = [
         (0u32, SpecializationConstant::U32(min_subgroup_size)),
-        // MAX_EXTREMA
+        // MAX_EXTREMA, must be multiple of extremum_block_len
         (1, SpecializationConstant::U32(params.max_extrema)),
+        // MAX_RETRY_EXTREMA
+        (2, SpecializationConstant::U32(params.max_retry_extrema)),
         // MAX_KEYPOINTS
-        (2, SpecializationConstant::U32(params.max_keypoints)),
+        (3, SpecializationConstant::U32(params.max_keypoints)),
         // EXTREMUM_BLOCK_LEN
-        (3, SpecializationConstant::U32(params.extremum_block_len)),
+        (4, SpecializationConstant::U32(params.extremum_block_len)),
         // PATCH_PYRAMID_LEVELS
-        (4, SpecializationConstant::U32(params.patch_pyr_levels)),
+        (5, SpecializationConstant::U32(params.patch_pyr_levels)),
     ];
     const SPECIALIZATION_PANIC_MSG: &str = "Wrong specialization constants";
 
@@ -139,12 +147,13 @@ pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipe
     let swt_sparse1_stage = shader_stage!(load_swt_sparse1);
     let swt_sparse2_stage = shader_stage!(load_swt_sparse2);
     let scan_extrema_stage = shader_stage!(load_scan_extrema);
+    let retry_interpolation_stage = shader_stage!(load_retry_interpolation);
     let blur_pyramid_stage = shader_stage!(load_blur_pyramid);
 
     let keypoint_orientation_stage = shader_stage!(load_keypoint_orientation);
     let patch_gradients_stage = {
         let mut spec_consts = specialization_constants.to_vec();
-        spec_consts.push((5, SpecializationConstant::U32(if params.debug_readout_patches { 1 } else { 0 })));
+        spec_consts.push((6, SpecializationConstant::U32(if params.debug_readout_patches { 1 } else { 0 })));
         let shader = match params.precision {
             Precision::Float32 => shaders_f32::load_patch_gradients(&vk.device),
             Precision::Float16 => {
@@ -168,6 +177,7 @@ pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipe
         &swt_sparse1_stage,
         &swt_sparse2_stage,
         &scan_extrema_stage,
+        &retry_interpolation_stage,
         &blur_pyramid_stage,
         &keypoint_orientation_stage,
         &patch_gradients_stage,
@@ -257,6 +267,7 @@ pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipe
     let swt_sparse1 = make_pipeline(swt_sparse1_stage)?;
     let swt_sparse2 = make_pipeline(swt_sparse2_stage)?;
     let scan_extrema = make_pipeline(scan_extrema_stage)?;
+    let retry_interpolation = make_pipeline(retry_interpolation_stage)?;
     let blur_pyramid = make_pipeline(blur_pyramid_stage)?;
     let keypoint_orientation = make_pipeline(keypoint_orientation_stage)?;
     let patch_gradients = make_pipeline(patch_gradients_stage)?;
@@ -273,6 +284,7 @@ pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipe
         swt_sparse2,
         swt,
         scan_extrema,
+        retry_interpolation,
         blur_pyramid,
         keypoint_orientation,
         patch_gradients,
@@ -289,7 +301,9 @@ pub fn create_pipelines(params: &FixedParams, vk: &Vulkan) -> Result<ComputePipe
 #[derive(Debug, Clone)]
 pub struct ExtremumLocationsBufferLayout {
     pub offset_n_extrema: usize,
+    pub offset_n_retry_extrema: usize,
     pub offset_coords: usize,
+    pub offset_retry_coords: usize,
 
     pub size_total: u64,
     pub layout: DeviceLayout,
@@ -299,20 +313,23 @@ pub struct ExtremumLocationsBufferLayout {
 pub fn extremum_locations_buffer_layout(
     params: &FixedParams,
 ) -> Result<ExtremumLocationsBufferLayout, crate::vulkan::VulkanError> {
-    let max_extrema = params.max_extrema;
-
     let elsize = size_of::<u32>();
     let offset_n_extrema = 0;
-    let offset_coords: usize = 16 * elsize;
+    let offset_n_retry_extrema = 16 * elsize;
+    let offset_coords: usize = offset_n_retry_extrema + 16 * elsize;
 
-    let size_extremum_locations = u64::from(4 * max_extrema) * elsize as u64;
-    let size_total = (1u64 + 15) * elsize as u64 + size_extremum_locations;
-    assert!(size_extremum_locations <= size_total);
+    let size_extremum_locations = u64::from(4 * params.max_extrema) * elsize as u64;
+    let offset_retry_coords: usize = offset_coords as usize + size_extremum_locations as usize;
+    let size_retry_locations = u64::from(3 * params.max_retry_extrema) * elsize as u64;
+
+    let size_total = 2 * 16 * elsize as u64 + size_extremum_locations + size_retry_locations as u64;
     let layout = DeviceLayout::from_size_alignment(size_total, 4u64).ok_or(crate::vulkan::VulkanError::TODO)?;
     assert!(params.extremum_block_len > 0);
     Ok(ExtremumLocationsBufferLayout {
         offset_n_extrema,
+        offset_n_retry_extrema,
         offset_coords,
+        offset_retry_coords,
         layout,
         size_total,
         block_len: params.extremum_block_len as usize,
