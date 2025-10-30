@@ -77,6 +77,10 @@ fn do_combinations(c: &mut Criterion, name: &str, scales_max_features: &[(f32, i
         )
         .unwrap();
 
+        let local_features::FeaturesResult { keypoints, .. } = lf
+            .detect_extract_all(&image_f32.view(), &Default::default())
+            .unwrap();
+        assert_eq!(keypoints.len(), max_features as usize);
         group.bench_with_input(BenchmarkId::new("Ours", &input_name), &input, |b, _| {
             b.iter(|| {
                 lf.detect_extract_all(&image_f32.view(), &Default::default())
