@@ -98,6 +98,8 @@ Requirements for library (nix devshell also contains everything):
  - Rust
  - Vulkan SDK
 
+*Note for Intel*: you may need to [allow long-running dispatches](https://www.intel.com/content/www/us/en/docs/oneapi/installation-guide-hpc-cluster/2024-0/step-4-set-up-user-permissions-for-using-the.html#ALLOW-LONG-RUNNING-GPU-KERNELS) to run Vulkan compute workloads.
+
 ## Examples
 
 ### Simple
